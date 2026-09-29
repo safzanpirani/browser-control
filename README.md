@@ -437,6 +437,36 @@ human flow, log in through the browser and repeat the capture with the same
 profile name instead. Child stdout and stderr are redacted before Browser
 Control returns them.
 
+## Use Several Browser Profiles
+
+Each relay accepts one extension connection, and the extension connects to port
+19989 by default. To control several browser profiles at once, run one relay per
+profile and give each profile its own copy of the extension.
+
+1. Copy the extension directory once per extra profile.
+2. Add a `relay-port.json` file to each copy with a unique port:
+
+   ```bash
+   cp -R "$(npm root --global)/@opencode-ai/browser-control/extension/dist" ~/.browser-control/extension-profile2
+   echo '{ "port": 19990 }' > ~/.browser-control/extension-profile2/relay-port.json
+   ```
+
+3. Load each copy as an unpacked extension in its own profile. A profile without
+   a copy keeps the default port 19989.
+4. Set `BROWSER_CONTROL_PORT` on every command that targets an extra profile.
+   The first command starts that port's relay. Sessions are stored per port.
+
+   ```bash
+   BROWSER_CONTROL_PORT=19990 browser-control execute 'return page.url()'
+   BROWSER_CONTROL_PORT=19990 browser-control status
+   ```
+
+The extension ID stays the same across copies because the manifest pins a key,
+so the relay needs no extra origin allowlist. An invalid or missing
+`relay-port.json` falls back to 19989. A new extension build does not update the
+copies. Repeat the copy and the `relay-port.json` step after each upgrade, then
+reload each profile's extension.
+
 ## Safety Boundaries
 
 Browser Control trusts the local agent code it executes. It is a driver, not an

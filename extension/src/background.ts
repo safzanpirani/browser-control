@@ -14,7 +14,8 @@ import { getOwnedDebuggerTabIds } from "./debugger-ownership.ts"
 import { completeExtensionHandshake, reconnectAlarmName, startConnectionLifecycle, startSocketKeepAlive } from "./connection-lifecycle.ts"
 
 const relayHost = "127.0.0.1"
-const relayPort = 19989
+const defaultRelayPort = 19989
+const relayPortFile = "relay-port.json"
 const offscreenDocumentPath = "offscreen.html"
 const maxRecordingSocketBufferedBytes = 16 * 1024 * 1024
 
@@ -87,11 +88,30 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
   return true
 })
 
+/**
+ * Each browser profile needs its own relay, so a copy of the extension can pin
+ * its port with a packaged `relay-port.json` ({ "port": 19990 }). A missing or
+ * invalid file keeps the default port.
+ */
+async function loadRelayPort(): Promise<number> {
+  try {
+    const response = await fetch(chrome.runtime.getURL(relayPortFile))
+    if (!response.ok) return defaultRelayPort
+    const config: unknown = await response.json()
+    const port = typeof config === "object" && config !== null ? (config as { port?: unknown }).port : undefined
+    return typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535 ? port : defaultRelayPort
+  } catch {
+    return defaultRelayPort
+  }
+}
+
+const relayPortReady = loadRelayPort()
+
 function connect(): void {
   void ensureConnection().catch(() => {})
 }
 
-function startConnection(): WebSocket {
+function startConnection(relayPort: number): WebSocket {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer)
     reconnectTimer = undefined
@@ -132,8 +152,19 @@ async function ensureConnection(): Promise<void> {
   if (connectionPromise) {
     return connectionPromise
   }
-  const current = socket?.readyState === WebSocket.CONNECTING ? socket : startConnection()
-  const pending = new Promise<void>((resolve, reject) => {
+  const pending = openConnection()
+  connectionPromise = pending
+  try {
+    await pending
+  } finally {
+    if (connectionPromise === pending) connectionPromise = undefined
+  }
+}
+
+async function openConnection(): Promise<void> {
+  const relayPort = await relayPortReady
+  const current = socket?.readyState === WebSocket.CONNECTING ? socket : startConnection(relayPort)
+  return new Promise<void>((resolve, reject) => {
     if (current.readyState === WebSocket.OPEN) {
       resolve()
       return
@@ -166,12 +197,6 @@ async function ensureConnection(): Promise<void> {
     current.addEventListener("error", onError, { once: true })
     current.addEventListener("close", onClose, { once: true })
   })
-  connectionPromise = pending
-  try {
-    await pending
-  } finally {
-    if (connectionPromise === pending) connectionPromise = undefined
-  }
 }
 
 async function announceHelloAndAttachedTabs(currentSocket: WebSocket, currentGeneration: number): Promise<void> {

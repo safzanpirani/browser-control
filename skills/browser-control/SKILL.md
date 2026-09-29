@@ -105,10 +105,15 @@ Prefer adoption for authenticated browser state rather than reproducing login
 in a fresh page.
 
 Each relay controls one browser/profile at a time. A second extension connection
-cannot replace a healthy active connection. If `status` or `doctor` reports
-rejected competing connections, keep the extension enabled only in the intended
-browser/profile. To switch browsers, disconnect the incumbent extension first;
-creating a new execute session does not switch browsers.
+cannot replace a healthy active connection. To control several profiles at once,
+run one relay per profile: copy the extension directory, add a
+`relay-port.json` file such as `{ "port": 19990 }` to the copy, load the copy as
+an unpacked extension in that profile, and set `BROWSER_CONTROL_PORT=19990` on
+every command for that profile. Profiles without a copy use the default port
+19989. If `status` or `doctor` reports rejected competing connections, either
+give the extra profile its own port or keep the extension enabled only in the
+intended browser/profile. Creating a new execute session does not switch
+browsers.
 
 Completion: the selected page URL is the intended page, and later work either
 retains the returned session id or intentionally uses the MCP process session.
@@ -551,8 +556,13 @@ Common diagnoses:
 - Incompatible extension protocol: update either the extension or npm package;
   exact extension and relay release versions do not need to match.
 - Competing browser/profile connections: the active browser is preserved and
-  additional connections are rejected. Use one browser/profile per relay;
-  repeatedly creating sessions or resetting tabs does not switch browsers.
+  additional connections are rejected. Use one browser/profile per relay by
+  giving each extra profile an extension copy with its own `relay-port.json` and
+  a matching `BROWSER_CONTROL_PORT`; repeatedly creating sessions or resetting
+  tabs does not switch browsers.
+- Extension copy shows `ERR_CONNECTION_REFUSED` for its port: the relay for that
+  port is not running yet. Run any command with `BROWSER_CONTROL_PORT` set to
+  that port to start it.
 - Stale relay build: inspect `doctor`, then coordinate an explicit
   `browser-control relay restart`. It requires an exact managed instance and
   safe shutdown protocol 2. Legacy relays need a one-time coordinated manual
