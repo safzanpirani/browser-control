@@ -275,14 +275,16 @@ describe("NetworkCapture", () => {
     await Effect.runPromise(recorder.cancel())
   })
 
-  it("redacts short typed values from execute output after capture", async () => {
+  it("redacts typed credential values but not short ones from execute output after capture", async () => {
     const page = new FakePage()
     const recorder = new Recorder()
     await Effect.runPromise(recorder.start(page as unknown as Page))
-    page.exchange({ requestHeaders: [{ name: "Cookie", value: "count=1" }] })
+    page.exchange({ requestHeaders: [{ name: "Cookie", value: "count=1; uid=90817263" }] })
     await recorder.settleForOutput()
 
-    expect(recorder.redactValue(1)).toBe("${BC_SECRET_1}")
+    expect(recorder.redactValue(1)).toBe(1)
+    expect(recorder.redactValue({ price: "Flat 10% off" })).toEqual({ price: "Flat 10% off" })
+    expect(recorder.redactValue(90817263)).toBe("${BC_SECRET_2}")
     await Effect.runPromise(recorder.cancel())
   })
 

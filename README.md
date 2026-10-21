@@ -435,7 +435,8 @@ browser-control secrets refresh github --session github
 updating values observed at the same source. If reauthentication requires a
 human flow, log in through the browser and repeat the capture with the same
 profile name instead. Child stdout and stderr are redacted before Browser
-Control returns them.
+Control returns them. Known values shorter than six characters are not
+rewritten, so digits and flags in ordinary output stay readable.
 
 ## Use Several Browser Profiles
 

@@ -200,11 +200,16 @@ describe("SecretCollector", () => {
       .toEqual([{ name: "Cookie", value: "sid=${BC_SECRET_1}; sid=${BC_SECRET_2}" }])
   })
 
-  it("redacts short exact values from command and execute output", () => {
-    expect(redactKnownValues("https://example.com/v1/dark-mode?limit=10", [
-      { ref: "BC_SECRET_1", value: "1" },
+  it("leaves ordinary text alone when known values are too short to be credentials", () => {
+    const slots = [
+      { ref: "BC_SECRET_9", value: "0" },
+      { ref: "BC_SECRET_4", value: "1" },
       { ref: "BC_SECRET_2", value: "dark" },
-    ])).toBe("https://example.com/v${BC_SECRET_1}/${BC_SECRET_2}-mode?limit=${BC_SECRET_1}0")
+      { ref: "BC_SECRET_3", value: "session-cookie-value" },
+    ]
+    expect(redactKnownValues("Flat 30% off, rated 4.1, dark mode", slots)).toBe("Flat 30% off, rated 4.1, dark mode")
+    expect(redactKnownValues("with 10 client headers sid=session-cookie-value", slots))
+      .toBe("with 10 client headers sid=${BC_SECRET_3}")
   })
 
   it("does not rewrite stable placeholders during exact-value output redaction", () => {
@@ -222,12 +227,12 @@ describe("SecretCollector", () => {
   it("combines known values and secret-shaped fields without changing nested scalar semantics", () => {
     const collector = new SecretCollector([
       { ref: "BC_SECRET_1", value: "known-token", sources: ["request.header.authorization"] },
-      { ref: "BC_SECRET_2", value: "42", sources: ["request.body.pin"] },
+      { ref: "BC_SECRET_2", value: "424242", sources: ["request.body.pin"] },
       { ref: "BC_SECRET_3", value: "false", sources: ["request.body.flag"] },
     ])
     const input = {
       label: "prefix known-token ${BC_SECRET_1}",
-      items: [42, false, null, "", { password: ["unknown", 42, false, null, "", { nested: "known-token" }] }],
+      items: [424242, false, null, "", { password: ["unknown", 424242, false, null, "", { nested: "known-token" }] }],
       credentials: { empty: "", missing: null, flag: false, nested: [{ label: "not previously observed" }] },
       untouched: { value: "plain", count: 7 },
     }
@@ -235,7 +240,7 @@ describe("SecretCollector", () => {
 
     expect(collector.redactValue(input)).toEqual({
       label: "prefix ${BC_SECRET_1} ${BC_SECRET_1}",
-      items: ["${BC_SECRET_2}", "${BC_SECRET_3}", null, "", { password: ["[REDACTED]", "[REDACTED]", "[REDACTED]", null, "", { nested: "[REDACTED]" }] }],
+      items: ["${BC_SECRET_2}", false, null, "", { password: ["[REDACTED]", "[REDACTED]", "[REDACTED]", null, "", { nested: "[REDACTED]" }] }],
       credentials: { empty: "", missing: null, flag: "[REDACTED]", nested: [{ label: "[REDACTED]" }] },
       untouched: { value: "plain", count: 7 },
     })
