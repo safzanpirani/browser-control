@@ -12,7 +12,7 @@ import {
   replayTargetCreated,
 } from "./cdp-shims.ts"
 import { CdpClientPool } from "./cdp-client-pool.ts"
-import { CdpRouter, isRootRoutableBrowserContextMethod } from "./cdp-router.ts"
+import { CdpRouter, isRootRoutableBrowserContextMethod, tabScopedCookieCommand } from "./cdp-router.ts"
 import { CdpRuntime } from "./cdp-runtime.ts"
 import { ExtensionRpc } from "./extension-rpc.ts"
 import { createHttpRequestHandler } from "./http-api.ts"
@@ -1354,10 +1354,15 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         : `CDP sessionId is required for ${message.method}`))
     }
     const { tabId } = route
+    // A validated root route already matched any requested context; an explicit
+    // context on a plain tab session is left for Chrome to reject.
+    const { method, params } = rootRoutable || requestedBrowserContextId === undefined
+      ? tabScopedCookieCommand(normalizedMessage.method, normalizedMessage.params ?? {})
+      : { method: normalizedMessage.method, params: normalizedMessage.params ?? {} }
     const command = {
       tabId,
-      method: normalizedMessage.method,
-      params: normalizedMessage.params ?? {},
+      method,
+      params,
       ...(route.chromeSessionId === undefined ? {} : { sessionId: route.chromeSessionId }),
     }
     const sessionId = message.sessionId

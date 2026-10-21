@@ -1,6 +1,6 @@
 import { ClientCdpSessionAlias, type CdpClientPool } from "./cdp-client-pool.ts"
 import { canClientSeeTarget } from "./cdp-visibility.ts"
-import type { TargetInfo } from "./protocol.ts"
+import type { JsonObject, TargetInfo } from "./protocol.ts"
 import { isRestrictedTarget } from "./relay-helpers.ts"
 import type { ChildTarget, ConnectedTarget } from "./relay-types.ts"
 import { shouldExposeChildTarget, type TargetRegistry } from "./target-registry.ts"
@@ -15,6 +15,22 @@ const rootRoutableBrowserContextMethods = new Set([
 
 export function isRootRoutableBrowserContextMethod(method: string): boolean {
   return rootRoutableBrowserContextMethods.has(method)
+}
+
+// Chrome resolves Storage cookie commands through the browser's default context,
+// which is the last-focused profile, even when sent to a tab session; it rejects
+// browserContextId there. The Network equivalents use the tab's own profile.
+const tabScopedCookieMethods = new Map([
+  ["Storage.getCookies", "Network.getAllCookies"],
+  ["Storage.setCookies", "Network.setCookies"],
+])
+
+/** Rewrite a cookie command so it reads or writes the routed tab's profile, not the last-focused one. */
+export function tabScopedCookieCommand(method: string, params: JsonObject): { readonly method: string; readonly params: JsonObject } {
+  const tabMethod = tabScopedCookieMethods.get(method)
+  if (!tabMethod) return { method, params }
+  const { browserContextId: _browserContextId, ...tabParams } = params
+  return { method: tabMethod, params: tabParams }
 }
 
 export type CdpRoutedSession = {

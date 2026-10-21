@@ -262,7 +262,9 @@ multi-page sessions and browser CDP aliases, or exactly one visible root for raw
 clients, without falling through from a named client to an unrelated tab.
 Explicit browser-context ids must match a healthy visible root. Raw clients may
 route through several visible roots only when every root proves the same
-Chromium context; crashed roots never satisfy context routing.
+Chromium context; crashed roots never satisfy context routing. Cookie reads and
+writes go to the routed tab as `Network.getAllCookies`/`Network.setCookies`,
+because Chrome resolves `Storage` cookie commands to the last-focused profile.
 
 ### CDP client state is isolated per connection
 

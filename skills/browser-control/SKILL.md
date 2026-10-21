@@ -115,6 +115,11 @@ give the extra profile its own port or keep the extension enabled only in the
 intended browser/profile. Creating a new execute session does not switch
 browsers.
 
+When several profiles share one Chrome, `context.cookies()` and
+`context.addCookies()` read and write the session page's profile. Chrome has no
+tab-scoped permission command, so `context.grantPermissions()` and
+`context.clearPermissions()` apply to the most recently focused profile window.
+
 Completion: the selected page URL is the intended page, and later work either
 retains the returned session id or intentionally uses the MCP process session.
 

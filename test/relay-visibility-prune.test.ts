@@ -33,8 +33,8 @@ describe("relay target visibility pruning", () => {
           method: "debugger.sendCommand",
           params: {
             tabId: 1,
-            method: "Storage.getCookies",
-            params: { browserContextId: "raw-context" },
+            method: "Network.getAllCookies",
+            params: {},
           },
         }))
 
@@ -122,16 +122,19 @@ describe("relay target visibility pruning", () => {
           yield* Effect.promise(() => sendCdp(sessionClient, command))
         }
 
+        // Storage cookie commands on a tab session reach Chrome's last-focused
+        // profile, so the relay sends the tab-scoped Network equivalents.
+        const expectedForwarded = [
+          { method: "Browser.grantPermissions", params: routedCommands[0]?.params },
+          { method: "Browser.resetPermissions", params: routedCommands[1]?.params },
+          { method: "Network.getAllCookies", params: {} },
+          { method: "Network.setCookies", params: { cookies: [{ name: "theme", value: "dark", domain: "example.com", path: "/" }] } },
+        ]
         const forwarded = extension.commands.filter((command) => command.method === "debugger.sendCommand")
-        expect(forwarded).toHaveLength(routedCommands.length)
-        for (const [index, command] of routedCommands.entries()) {
-          expect(forwarded[index]?.params).toEqual({
-            tabId: crashFirst ? 3 : 2,
-            method: command.method,
-            params: command.params,
-          })
-          expect(forwarded[index]?.params).not.toHaveProperty("sessionId")
-        }
+        expect(forwarded.map((command) => command.params)).toEqual(expectedForwarded.map((expected) => ({
+          tabId: crashFirst ? 3 : 2,
+          ...expected,
+        })))
 
         yield* Effect.promise(async () => {
           await expect(sendCdp(sessionClient, {

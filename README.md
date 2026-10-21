@@ -468,6 +468,11 @@ so the relay needs no extra origin allowlist. An invalid or missing
 copies. Repeat the copy and the `relay-port.json` step after each upgrade, then
 reload each profile's extension.
 
+Cookie commands such as `context.cookies()` and `context.addCookies()` use the
+session page's own profile. Permission commands such as
+`context.grantPermissions()` cannot be scoped to a tab: Chrome applies them to
+the most recently focused profile window.
+
 ## Safety Boundaries
 
 Browser Control trusts the local agent code it executes. It is a driver, not an

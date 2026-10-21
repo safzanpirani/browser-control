@@ -101,6 +101,9 @@ local Node relay.
   they all prove the same Chromium context. Explicit context ids are validated;
   a named client never falls back to an unrelated unowned tab. Crashed roots
   remain visible and explicitly targetable but never satisfy context routing.
+  Chrome resolves `Storage.getCookies`/`setCookies` on a tab session to the
+  last-focused profile, so the relay sends them as `Network.getAllCookies`/
+  `Network.setCookies`, which use the tab's own profile.
 - Human handoff waiters live in `src/handoff.ts`; derive their stable CDP target
   id from the actual Playwright `Page`, then bind the exact registry
   target/tab/session. The relay resolves only a matching handoff id from that
