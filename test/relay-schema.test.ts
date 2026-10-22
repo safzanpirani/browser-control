@@ -1,3 +1,5 @@
+import crypto from "node:crypto"
+import fs from "node:fs"
 import { describe, expect, it } from "vitest"
 import { Schema } from "effect"
 import {
@@ -24,6 +26,7 @@ import {
   SessionsContainer,
   SessionSummary,
   TargetSummaries,
+  relayClientProtocolVersion,
 } from "../src/relay-schema.ts"
 
 const decodeSession = Schema.decodeUnknownSync(SessionSummary)
@@ -381,5 +384,27 @@ describe("relay-schema", () => {
     expect(decodeErrorEnvelope({ error: "missing", code: "target-not-found" })).toEqual({ error: "missing", code: "target-not-found" })
     expect(decodeErrorEnvelope({ error: "legacy" })).toEqual({ error: "legacy" })
     expect(() => decodeErrorEnvelope({ error: "bad", code: "made-up" })).toThrow()
+  })
+})
+
+describe("relay client protocol", () => {
+  it("is reviewed whenever the relay wire schema changes", () => {
+    // CLI-only rebuilds rely on relayClientProtocolVersion to keep using a
+    // running relay. When this fingerprint changes, decide whether the change
+    // breaks older relays or clients: if it does, bump relayClientProtocolVersion.
+    // Either way, record the new fingerprint here.
+    const fingerprint = crypto.createHash("sha256")
+      .update(fs.readFileSync(new URL("../src/relay-schema.ts", import.meta.url)))
+      .digest("hex")
+    expect({ relayClientProtocolVersion, fingerprint }).toEqual({
+      relayClientProtocolVersion: 1,
+      fingerprint: "60329f97a51205e92bf5755afdf2acb8586eb93bf25d617ffed5dccc60c02313",
+    })
+  })
+
+  it("decodes the client protocol a relay reports", () => {
+    expect(decodeRelayVersion({ version: "0.8.3", buildId: "2026-10-23T00:00:00.000Z", clientProtocol: 1 }))
+      .toMatchObject({ clientProtocol: 1 })
+    expect(() => decodeRelayVersion({ version: "0.8.3", clientProtocol: 1.5 })).toThrow()
   })
 })

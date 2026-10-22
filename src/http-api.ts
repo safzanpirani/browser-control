@@ -30,6 +30,7 @@ import {
   RecordingStartRequest,
   RecordingTargetRequest,
   RelayShutdownRequest,
+  relayClientProtocolVersion,
   SessionAdoptRequest,
   SessionIdRequest,
   SessionEnsureRequest,
@@ -88,6 +89,7 @@ export function createHttpRequestHandler(options: {
         pid: options.relayInstance.pid,
         managed: options.relayInstance.managed,
         shutdownProtocol: 2,
+        clientProtocol: relayClientProtocolVersion,
       })
       return
     }

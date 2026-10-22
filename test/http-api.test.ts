@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createHttpRequestHandler } from "../src/http-api.ts"
 import { FlightRecorderRelay } from "../src/flight-recorder.ts"
 import { RecordingRelay } from "../src/recording-relay.ts"
-import { ExecuteRequest, RelayShutdownRequest, SessionAdoptRequest } from "../src/relay-schema.ts"
+import { ExecuteRequest, relayClientProtocolVersion, RelayShutdownRequest, SessionAdoptRequest } from "../src/relay-schema.ts"
 import { RelayShutdown } from "../src/relay-shutdown.ts"
 import { BrowserControlSessions } from "../src/session-manager.ts"
 import { TargetRegistry } from "../src/target-registry.ts"
@@ -213,6 +213,7 @@ describe("HTTP request schemas", () => {
         pid: 123,
         managed: true,
         shutdownProtocol: 2,
+        clientProtocol: relayClientProtocolVersion,
       })
       const extension = await fetch(`http://127.0.0.1:${port}/extension/status`).then((response) => response.json())
       expect(extension).toMatchObject({

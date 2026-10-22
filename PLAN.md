@@ -700,7 +700,10 @@ not contain expressions, arguments, results, headers, cookies, or form values.
 `scripts/build-cli.ts` injects the package version and build id. Source runs use
 `0.0.0-dev` and a deterministic fingerprint of `src/*.ts`, `package.json`, and
 `pnpm-lock.yaml`; runtime code does not hardcode release versions. The
-relay reports both values so `doctor` can identify a stale long-running relay.
+relay reports both values plus a relay client protocol version. Clients accept a
+relay on the same client protocol even after a CLI-only rebuild changes the build
+id; only an incompatible protocol (or a legacy relay without one from another
+build) blocks relay-backed commands, and `doctor` still notes build drift.
 It also reports an instance id, start time, and PID; bounded managed-relay
 process-fault diagnostics are retained locally so unexpected same-build
 restarts can be distinguished from session eviction.

@@ -241,9 +241,12 @@ local Node relay.
   to adopted user tabs.
 - The version string and build id are injected by `scripts/build-cli.ts`
   (`src/version.ts`; source runs use `0.0.0-dev` and a deterministic source
-  and dependency-lock fingerprint). The relay
-  reports both so `doctor` can detect a long-running relay left stale by a CLI
-  rebuild; never hardcode version literals.
+  and dependency-lock fingerprint); never hardcode version literals. The relay
+  reports both plus `clientProtocol` (`relayClientProtocolVersion` in
+  `src/relay-schema.ts`). Clients accept a running relay with the same client
+  protocol even when its build differs, so CLI-only rebuilds stay
+  non-disruptive; bump the protocol only for incompatible relay HTTP contract
+  changes. Legacy relays without `clientProtocol` still require the exact build.
 - Relay version metadata includes an instance id, start time, and PID. Bounded
   managed-relay process-fault diagnostics are retained with mode `0600` in
   `~/.browser-control/relay.log` so same-build restarts and session loss are

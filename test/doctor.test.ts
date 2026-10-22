@@ -57,7 +57,20 @@ describe("relayBuildCheck", () => {
     expect(relayBuildCheck({
       cliBuildId: "build-current",
       relayResult: { ok: true, value: { version: "0.1.0", buildId: "build-old" } },
-    })).toMatchObject({ status: "warn", message: "runtime build-old does not match CLI build-current" })
+    })).toMatchObject({ status: "warn", message: "runtime build-old is incompatible with CLI build-current" })
+  })
+
+  it("accepts a relay from another build on the same client protocol", () => {
+    expect(relayBuildCheck({
+      cliBuildId: "build-current",
+      clientProtocol: 1,
+      relayResult: { ok: true, value: { version: "0.1.0", buildId: "build-old", clientProtocol: 1 } },
+    })).toMatchObject({ status: "ok", message: "runtime build-old differs from CLI build-current; client protocol 1 is compatible" })
+    expect(relayBuildCheck({
+      cliBuildId: "build-current",
+      clientProtocol: 2,
+      relayResult: { ok: true, value: { version: "0.1.0", buildId: "build-old", clientProtocol: 1 } },
+    })).toMatchObject({ status: "warn", message: "runtime build-old is incompatible with CLI build-current" })
   })
 
   it("warns when an older relay does not report a build id", () => {
@@ -71,7 +84,7 @@ describe("relayBuildCheck", () => {
     expect(relayBuildCheck({
       cliBuildId: "dev",
       relayResult: { ok: true, value: { version: "0.1.0", buildId: "build-from-dist" } },
-    })).toMatchObject({ status: "warn", message: "runtime build-from-dist does not match CLI dev" })
+    })).toMatchObject({ status: "warn", message: "runtime build-from-dist is incompatible with CLI dev" })
   })
 })
 
