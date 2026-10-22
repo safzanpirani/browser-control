@@ -48,6 +48,11 @@ Agent / MCP client / CLI
   speaking safe shutdown protocol 2 (`RelayShutdown`), which closes admission,
   drains accepted work and persistence, and refuses raw CDP clients or active
   recordings/captures.
+- The relay reports its version, build id, and a relay client protocol version.
+  Clients accept a relay on the same client protocol even after a CLI-only
+  rebuild changes the build id; only an incompatible protocol (or a legacy relay
+  without one from another build) blocks relay-backed commands, and `doctor`
+  still notes build drift.
 - Runtime candidates are built and validated outside the live checkout via
   `pnpm runtime:prepare` and activated atomically for future CLI/MCP processes
   via `pnpm runtime:select`.

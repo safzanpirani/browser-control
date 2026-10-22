@@ -545,7 +545,10 @@ Current limitations:
   running relay automatically.
 - **After an npm upgrade**: reload the unpacked extension. Extension and relay
   versions may differ when they use the same reported protocol version.
-- **Stale relay warning**: ordinary commands never replace a running relay.
+- **Stale relay warning**: a CLI rebuild keeps using a running relay that
+  reports the same relay client protocol (`status` shows a note about the
+  differing build). An incompatible protocol, or a legacy relay from another
+  build, fails relay-backed commands. Ordinary commands never replace a running relay.
   Coordinate with other users, finish recordings and raw CDP work, then run
   `browser-control relay restart`. It drains accepted work and preserves tabs
   and durable session identity, but JavaScript state and snapshot refs reset.

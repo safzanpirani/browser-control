@@ -10,6 +10,7 @@ import {
   extensionReconnectWaitMs,
   managedRelayEntrypoint,
   managedRelayLaunch,
+  relayBuildDrift,
   relayBuildProblem,
   restartRelay,
   startManagedRelay,
@@ -529,6 +530,39 @@ describe("relay lifecycle", () => {
       { ...version, buildId: "2026-08-06T12:00:00.000Z" },
       "2026-08-05T12:00:00.000Z",
     )).toContain("refresh or restart this CLI or MCP client")
+  })
+
+  it("accepts a relay from another build that speaks the same client protocol", async () => {
+    const running = { ...version, buildId: "2026-10-21T17:00:00.000Z", clientProtocol: 1, instanceId: "running", managed: true, shutdownProtocol: 2 as const }
+    let stops = 0
+    const result = await Effect.runPromise(ensureRelay({
+      relay: relay({
+        version: Effect.succeed(running),
+        shutdown: () => Effect.sync(() => { stops++; return { stopping: true as const } }),
+      }),
+      buildId: "2026-10-23T02:00:00.000Z",
+      clientProtocol: 1,
+      start: Effect.die("should not start"),
+    }))
+
+    expect(result).toEqual({ version: running, started: false })
+    expect(stops).toBe(0)
+    expect(relayBuildDrift(running, "2026-10-23T02:00:00.000Z", 1)).toContain("compatible protocol 1")
+    expect(relayBuildDrift(running, running.buildId, 1)).toBeUndefined()
+  })
+
+  it("still demands a restart when the relay client protocol differs", () => {
+    const running = { ...version, buildId: "2026-10-21T17:00:00.000Z", clientProtocol: 1 }
+    expect(relayBuildProblem(running, "2026-10-23T02:00:00.000Z", 2)).toContain("browser-control relay restart")
+    expect(relayBuildProblem(running, "2026-10-23T02:00:00.000Z", 2)).toContain("incompatible with CLI protocol 2")
+    expect(relayBuildProblem({ ...running, clientProtocol: 3 }, "2026-10-23T02:00:00.000Z", 2))
+      .toContain("refresh or restart this CLI or MCP client")
+    expect(relayBuildDrift(running, "2026-10-23T02:00:00.000Z", 2)).toBeUndefined()
+  })
+
+  it("requires the exact build from legacy relays that do not report a client protocol", () => {
+    expect(relayBuildProblem({ ...version, buildId: "2026-10-21T17:00:00.000Z" }, "2026-10-23T02:00:00.000Z", 1))
+      .toContain("does not match CLI build")
   })
 
   it("starts a managed relay through the CLI entrypoint from MCP builds and source", () => {

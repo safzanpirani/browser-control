@@ -44,6 +44,13 @@ After pushing, update the installed copy. See `~/code/control/AGENTS.md`.
   requires `browser-control relay restart`, an exact managed instance, and safe
   shutdown protocol 2 (`RelayShutdown`). Record bounded attribution in
   `lifecycle.jsonl` without URLs, expressions, or credentials.
+- The version string and build id come from `src/version.ts` (injected by
+  `scripts/build-cli.ts`); never hardcode version literals. The relay reports
+  both plus `clientProtocol` (`relayClientProtocolVersion` in
+  `src/relay-schema.ts`). Clients accept a running relay with the same client
+  protocol even when its build differs, so CLI-only rebuilds stay
+  non-disruptive; bump the protocol only for incompatible relay HTTP contract
+  changes. Legacy relays without `clientProtocol` still require the exact build.
 - Relay clients wait one reconnect alarm period plus a margin for the extension
   after relay startup, because only the alarm wakes a sleeping worker. Derive
   both from `extensionReconnectAlarmPeriodMs` in `src/protocol.ts`.

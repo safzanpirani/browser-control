@@ -41,8 +41,11 @@ For an externally supervised relay, set `BROWSER_CONTROL_AUTOSTART=false` to
 make ordinary calls fail when that relay is absent instead of launching another
 process. Existing relay connections and explicit `relay restart` still work.
 
-Ordinary CLI/MCP/SDK calls never replace a running relay. On a build mismatch,
-coordinate with other agents before running `browser-control relay restart`.
+Ordinary CLI/MCP/SDK calls never replace a running relay. A rebuilt CLI keeps
+using a relay from another build while both report the same relay client
+protocol; `status` notes the differing build. On an incompatible protocol (or
+a legacy relay from another build), coordinate with other agents before
+running `browser-control relay restart`.
 It preserves browser tabs and durable sessions but resets JavaScript state and
 snapshot refs. A busy or timed-out drain leaves the old relay running; finish
 recordings/captures and disconnect raw CDP clients rather than forcing a stop.
