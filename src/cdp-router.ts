@@ -33,6 +33,24 @@ function tabScopedCookieCommand(method: string, params: JsonObject): { readonly 
   return { method: tabMethod, params: tabParams }
 }
 
+// Chrome has no tab-scoped permission command: these always apply to the
+// browser's default context, the most recently focused profile.
+const focusedProfilePermissionMethods = new Set([
+  "Browser.grantPermissions",
+  "Browser.resetPermissions",
+  "Browser.setPermission",
+])
+
+export function appliesToFocusedProfile(method: string): boolean {
+  return focusedProfilePermissionMethods.has(method)
+}
+
+export function unfocusedProfilePermissionMessage(method: string): string {
+  return `Browser Control refused ${method}: Chrome applies permission changes to the most recently focused profile, `
+    + "and no window of this session's profile is focused, so the change could land in another profile. "
+    + "Focus a window of this profile in Chrome, then retry."
+}
+
 export type CdpRoutedSession = {
   readonly tabId: number
   readonly rootSessionId: string

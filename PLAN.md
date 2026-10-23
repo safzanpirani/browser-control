@@ -84,7 +84,9 @@ Agent / MCP client / CLI
   (skipping crashed roots for named clients), and root-versus-child Chrome
   session routing. Cookie reads and writes go to the routed tab as
   `Network.getAllCookies`/`Network.setCookies`, because Chrome resolves
-  `Storage` cookie commands to the last-focused profile.
+  `Storage` cookie commands to the last-focused profile. Permission commands
+  have no tab-scoped form, so the relay refuses them unless the extension
+  reports that a window of its profile has focus.
 - `CdpRuntime` owns register-before-send `Runtime.enable` context observation
   and bounded reset fallback.
 - `RootTargetLifecycle` owns per-tab debugger setup, verification, replacement

@@ -13,6 +13,19 @@ export const extensionProtocolVersion = 2
 export const extensionReconnectAlarmPeriodMs = 30_000
 const legacyExtensionProtocolVersion = 1
 
+/**
+ * Optional commands an extension advertises in its hello. The relay only sends
+ * them when advertised, so older extensions on the same protocol keep working.
+ */
+export const extensionCapabilities = ["windows.focusState"] as const
+
+export type ExtensionCapability = typeof extensionCapabilities[number]
+
+export function parseExtensionCapabilities(value: JsonValue | undefined): ReadonlySet<ExtensionCapability> {
+  if (!Array.isArray(value)) return new Set()
+  return new Set(extensionCapabilities.filter((capability) => value.includes(capability)))
+}
+
 export type ExtensionProtocolCompatibility = {
   readonly version: number | null
   readonly compatible: boolean
@@ -106,6 +119,7 @@ const extensionCommandMethodValues = [
   "recording.stop",
   "recording.status",
   "recording.cancel",
+  "windows.focusState",
 ] as const
 
 const extensionEventMethodValues = [

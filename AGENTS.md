@@ -79,7 +79,10 @@ After pushing, update the installed copy. See `~/code/control/AGENTS.md`.
   commands without a Chrome child `sessionId` (`chromeSessionIdForClientRequest`).
 - Chrome resolves `Storage.getCookies`/`setCookies` on a tab session to the
   last-focused profile, so the relay sends them as `Network.getAllCookies`/
-  `Network.setCookies`, which use the tab's own profile.
+  `Network.setCookies`, which use the tab's own profile. Permission commands
+  (`Browser.grantPermissions`/`resetPermissions`/`setPermission`) have no
+  tab-scoped form, so when the extension advertises the `windows.focusState`
+  capability the relay refuses them unless a window of its profile is focused.
 - `ProtectedFrameTracker` (`src/protected-frames.ts`) retracts and suppresses
   restricted child frames (`chrome-extension://` inline menus), marks
   `protectedUi` on the root target, and maps masked failures to

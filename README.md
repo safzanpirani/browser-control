@@ -506,7 +506,10 @@ reload each profile's extension.
 Cookie commands such as `context.cookies()` and `context.addCookies()` use the
 session page's own profile. Permission commands such as
 `context.grantPermissions()` cannot be scoped to a tab: Chrome applies them to
-the most recently focused profile window.
+the most recently focused profile window. So the relay refuses
+`grantPermissions()` and `clearPermissions()` unless a window of the session's
+profile is focused; focus that profile's window and retry. Extension builds
+older than this check forward them unchecked.
 
 ## Safety Boundaries
 

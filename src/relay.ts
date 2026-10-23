@@ -13,7 +13,7 @@ import {
   replayTargetCreated,
 } from "./cdp-shims.ts"
 import { CdpClientPool } from "./cdp-client-pool.ts"
-import { CdpRouter } from "./cdp-router.ts"
+import { appliesToFocusedProfile, CdpRouter, unfocusedProfilePermissionMessage } from "./cdp-router.ts"
 import { CdpRuntime } from "./cdp-runtime.ts"
 import { ExtensionRpc } from "./extension-rpc.ts"
 import { createHttpRequestHandler } from "./http-api.ts"
@@ -925,6 +925,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     extensionRpc.markHandshake(
       getString(message.params, "version"),
       message.params?.protocolVersion,
+      message.params?.capabilities,
     )
     return extensionGeneration
   }
@@ -1484,6 +1485,12 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       catch: (error) => error instanceof Error ? error : new Error(String(error)),
     })
     const { tabId } = route
+    // Older extensions cannot report focus; their permission commands keep
+    // Chrome's last-focused-profile behaviour, which the docs describe.
+    if (appliesToFocusedProfile(message.method) && extensionRpc.supports("windows.focusState")) {
+      const focus = yield* sendToExtension({ method: "windows.focusState", params: {} })
+      if (focus.focused !== true) return yield* Effect.fail(new Error(unfocusedProfilePermissionMessage(message.method)))
+    }
     tabActivity.touch(tabId)
     const executingSession = cdpClients.sessionId(socket)
     if (executingSession && sessions.isExecuting(executingSession)) {
