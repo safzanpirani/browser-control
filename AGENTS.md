@@ -115,6 +115,10 @@ local Node relay.
   status directly from `chrome.debugger.onDetach`: the relay owns root-detach
   classification, and ambiguous `target_closed` events from extension child
   targets must preserve the handoff UI.
+- Chrome can drop a child session (frame or worker) without a detach event
+  reaching the relay. When a command routed to a child fails with `Session with
+  given id not found`, the relay detaches that child before replying, so
+  Playwright disposes it and page-wide calls such as `page.unroute()` skip it.
 - Handoff `start` actions run only after the waiter and WAIT UI are registered.
   Require extension acknowledgement of WAIT before invoking `start`. Human
   completion waits for the action to settle and for the destination execution
