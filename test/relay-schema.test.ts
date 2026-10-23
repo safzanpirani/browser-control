@@ -399,8 +399,8 @@ describe("relay client protocol", () => {
       .update(fs.readFileSync(new URL("../src/relay-schema.ts", import.meta.url)))
       .digest("hex")
     expect({ relayClientProtocolVersion, fingerprint }).toEqual({
-      relayClientProtocolVersion: 1,
-      fingerprint: "60329f97a51205e92bf5755afdf2acb8586eb93bf25d617ffed5dccc60c02313",
+      relayClientProtocolVersion: 2,
+      fingerprint: "0c766123d4bdae611341e1fecfdf1b882ee484d36d45fe51febdb7e1af1d3af0",
     })
   })
 

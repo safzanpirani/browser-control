@@ -257,8 +257,12 @@ export interface ExtensionStatus extends Schema.Schema.Type<typeof ExtensionStat
  * client. Bump it only when a request/response shape or route meaning changes
  * incompatibly. A client accepts a running relay with the same value even when
  * its build id differs, so CLI-only rebuilds do not demand `relay restart`.
+ *
+ * 2: upstream merge added `removeAfterExecute`, optional adopt
+ * `targetSelection`, authenticated-request `headers`/handoff fields, and
+ * `/extension/reload`; protocol-1 relays would drop or reject them.
  */
-export const relayClientProtocolVersion = 1
+export const relayClientProtocolVersion = 2
 
 export const RelayVersion = Schema.Struct({
   version: Schema.String,
