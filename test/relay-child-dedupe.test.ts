@@ -599,4 +599,76 @@ describe("relay child target announce dedupe", () => {
       })
     })))
   })
+
+  it("detaches a child session Chrome no longer knows before replying with the error", async () => {
+    const port = await freePort()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* startRelay({ port, sessionCatalogPath: null })
+      yield* Effect.tryPromise(async () => {
+        const extension = await openSocket(`ws://127.0.0.1:${port}/extension`)
+        const extensionCommands: Array<{ readonly method: string; readonly params?: JsonObject }> = []
+        extension.on("message", (data) => {
+          const command = JSON.parse(data.toString()) as { readonly id: number; readonly method: string; readonly params?: JsonObject }
+          extensionCommands.push(command)
+          if (command.method === "debugger.sendCommand" && command.params?.sessionId === "oopif-session") {
+            extension.send(JSON.stringify({ id: command.id, error: "{\"code\":-32001,\"message\":\"Session with given id not found.\"}" }))
+            return
+          }
+          const result = command.method === "debugger.sendCommand" && command.params?.method === "Target.getTargetInfo"
+            ? { targetInfo: targetInfo("root-target") }
+            : {}
+          extension.send(JSON.stringify({ id: command.id, result }))
+        })
+        extension.send(JSON.stringify({ method: "hello", params: { version: "0.0.23", protocolVersion: 2 } }))
+        extension.send(JSON.stringify({ method: "toolbar.clicked", params: { tabId: 1 } }))
+        await waitFor(() => extensionCommands.some((command) => command.method === "action.setAttached"))
+
+        const client = await openSocket(`ws://127.0.0.1:${port}/devtools/browser/test`)
+        const messages: Array<CdpEvent | CdpReply> = []
+        client.on("message", (data) => {
+          messages.push(JSON.parse(data.toString()) as CdpEvent | CdpReply)
+        })
+        client.send(JSON.stringify({ id: 1, method: "Target.setAutoAttach", params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true } }))
+        await waitFor(() => messages.some((message) => "method" in message && message.method === "Target.attachedToTarget"))
+
+        // A cross-origin frame whose detach never reached the relay, e.g. torn
+        // down by a failed reload while request interception was active.
+        extension.send(JSON.stringify({
+          method: "debugger.event",
+          params: {
+            tabId: 1,
+            method: "Target.attachedToTarget",
+            params: { sessionId: "oopif-session", targetInfo: targetInfo("oopif-target", "iframe"), waitingForDebugger: false },
+          },
+        }))
+        await waitFor(() => messages.some((message) => "method" in message && message.method === "Target.attachedToTarget" && message.params?.sessionId === "oopif-session"))
+
+        const request: CdpRequest = { id: 2, sessionId: "oopif-session", method: "Network.setCacheDisabled", params: { cacheDisabled: false } }
+        client.send(JSON.stringify(request))
+        await waitFor(() => messages.some((message) => "id" in message && message.id === 2))
+
+        const detachIndex = messages.findIndex((message) => {
+          return "method" in message && message.method === "Target.detachedFromTarget" && message.params?.sessionId === "oopif-session"
+        })
+        const replyIndex = messages.findIndex((message) => "id" in message && message.id === 2)
+        expect(detachIndex).toBeGreaterThanOrEqual(0)
+        // Playwright disposes the session on the detach event, so the pending
+        // call fails as "closed" and page-wide calls skip the dead child.
+        expect(detachIndex).toBeLessThan(replyIndex)
+        expect(messages[replyIndex]).toMatchObject({ error: { message: expect.stringContaining("Session with given id not found") } })
+
+        const commandsBefore = extensionCommands.length
+        client.send(JSON.stringify({ ...request, id: 3 }))
+        await waitFor(() => messages.some((message) => "id" in message && message.id === 3))
+        expect(messages.find((message) => "id" in message && message.id === 3)).toMatchObject({
+          error: { message: "Unknown CDP session oopif-session for Network.setCacheDisabled" },
+        })
+        expect(extensionCommands.slice(commandsBefore).some((command) => command.method === "debugger.sendCommand")).toBe(false)
+        expect(extensionCommands.some((command) => command.method === "action.setAttached" && command.params?.attached === false)).toBe(false)
+
+        client.close()
+        extension.close()
+      })
+    })))
+  })
 })

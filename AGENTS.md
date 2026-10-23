@@ -87,6 +87,10 @@ After pushing, update the installed copy. See `~/code/control/AGENTS.md`.
   restricted child frames (`chrome-extension://` inline menus), marks
   `protectedUi` on the root target, and maps masked failures to
   `target/cross-extension-page` without replacing the page.
+- Chrome can drop a child session (frame or worker) without a detach event
+  reaching the relay. When a command routed to a child fails with `Session with
+  given id not found`, the relay detaches that child before replying, so
+  Playwright disposes it and page-wide calls such as `page.unroute()` skip it.
 - `session adopt` makes a user-attached tab the session's default page (and
   auto-selects when only one user-attached tab is open). Adopted tabs are never
   closed by `reset` or `delete`.
