@@ -1,9 +1,9 @@
-import { Effect, Schema } from "effect"
+import { Effect, Match, Schema } from "effect"
 import type { Page } from "playwright-core"
-import type {
-  AuthenticatedJsonMethod,
+import {
   AuthenticatedJsonOutcome,
-  AuthenticatedJsonRequest,
+  type AuthenticatedJsonMethod,
+  type AuthenticatedJsonRequest,
 } from "./relay-schema.ts"
 
 const defaultTimeoutMs = 30_000
@@ -24,6 +24,7 @@ type PageRequestInput = {
   readonly origin: string
   readonly method: AuthenticatedJsonMethod
   readonly url: string
+  readonly headers?: Readonly<Record<string, string>>
   readonly body?: unknown
   readonly timeoutMs: number
   readonly maxResponseBytes: number
@@ -65,23 +66,23 @@ export const requestJson = Effect.fn("AuthenticatedOrigin.requestJson")(function
 
   const actualOrigin = pageOrigin(page.url())
   if (actualOrigin !== origin) {
-    return {
-      _tag: "OriginMismatch",
+    return AuthenticatedJsonOutcome.cases.OriginMismatch.make({
       expectedOrigin: origin,
       actualOrigin,
-    } satisfies AuthenticatedJsonOutcome
+    })
   }
 
   const input: PageRequestInput = {
     origin,
     method: request.method,
     url: requestUrl,
+    ...(request.headers === undefined ? {} : { headers: request.headers }),
     ...(request.body === undefined ? {} : { body: request.body }),
     timeoutMs: request.timeoutMs ?? defaultTimeoutMs,
     maxResponseBytes: request.maxResponseBytes ?? defaultMaxResponseBytes,
   }
 
-  return yield* Effect.tryPromise({
+  const pageResult = yield* Effect.tryPromise({
     try: () => page.evaluate(runPageRequest, input),
     catch: (cause) => new AuthenticatedOriginError({
       message: cause instanceof Error ? cause.message : "Run authenticated page request",
@@ -89,6 +90,22 @@ export const requestJson = Effect.fn("AuthenticatedOrigin.requestJson")(function
       cause,
     }),
   }).pipe(Effect.uninterruptible)
+
+  return Match.value(pageResult).pipe(
+    Match.when({ kind: "OriginMismatch" }, ({ expectedOrigin, actualOrigin }) =>
+      AuthenticatedJsonOutcome.cases.OriginMismatch.make({ expectedOrigin, actualOrigin })),
+    Match.when({ kind: "HttpError" }, ({ status }) =>
+      AuthenticatedJsonOutcome.cases.HttpError.make({ status })),
+    Match.when({ kind: "ResponseTooLarge" }, ({ status, maxResponseBytes }) =>
+      AuthenticatedJsonOutcome.cases.ResponseTooLarge.make({ status, maxResponseBytes })),
+    Match.when({ kind: "Success" }, ({ status, value }) =>
+      AuthenticatedJsonOutcome.cases.Success.make({ status, value })),
+    Match.when({ kind: "InvalidJson" }, ({ status }) =>
+      AuthenticatedJsonOutcome.cases.InvalidJson.make({ status })),
+    Match.when({ kind: "RequestFailed" }, ({ outcome }) =>
+      AuthenticatedJsonOutcome.cases.RequestFailed.make({ outcome })),
+    Match.exhaustive,
+  )
 })
 
 export function normalizeOrigin(value: string): string {
@@ -134,7 +151,7 @@ function resolveRequestUrl(origin: string, path: string): string {
   return url.toString()
 }
 
-function resolveStartUrl(origin: string, value: string): string {
+export function resolveStartUrl(origin: string, value: string): string {
   const url = new URL(value, origin)
   if (url.origin !== origin) {
     throw new AuthenticatedOriginError({
@@ -153,10 +170,18 @@ function pageOrigin(value: string): string {
   }
 }
 
-async function runPageRequest(input: PageRequestInput): Promise<AuthenticatedJsonOutcome> {
+type PageRequestResult =
+  | { readonly kind: "OriginMismatch"; readonly expectedOrigin: string; readonly actualOrigin: string }
+  | { readonly kind: "HttpError"; readonly status: number }
+  | { readonly kind: "ResponseTooLarge"; readonly status: number; readonly maxResponseBytes: number }
+  | { readonly kind: "Success"; readonly status: number; readonly value: Schema.Schema.Type<typeof Schema.Json> }
+  | { readonly kind: "InvalidJson"; readonly status: number }
+  | { readonly kind: "RequestFailed"; readonly outcome: "not-sent" | "unknown" }
+
+async function runPageRequest(input: PageRequestInput): Promise<PageRequestResult> {
   if (window.location.origin !== input.origin) {
     return {
-      _tag: "OriginMismatch",
+      kind: "OriginMismatch",
       expectedOrigin: input.origin,
       actualOrigin: window.location.origin,
     }
@@ -167,6 +192,10 @@ async function runPageRequest(input: PageRequestInput): Promise<AuthenticatedJso
   let requestStarted = false
   try {
     const body = input.body === undefined ? undefined : JSON.stringify(input.body)
+    const headers: Record<string, string> = {
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+      ...(input.headers ?? {}),
+    }
     requestStarted = true
     const response = await window.fetch(input.url, {
       method: input.method,
@@ -174,17 +203,13 @@ async function runPageRequest(input: PageRequestInput): Promise<AuthenticatedJso
       mode: "same-origin",
       redirect: "error",
       signal: controller.signal,
-      ...(body === undefined
-        ? {}
-        : {
-            headers: { "content-type": "application/json" },
-            body,
-          }),
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      ...(body === undefined ? {} : { body }),
     })
 
     if (!response.ok) {
       await response.body?.cancel().catch(() => undefined)
-      return { _tag: "HttpError", status: response.status }
+      return { kind: "HttpError", status: response.status }
     }
 
     const reader = response.body?.getReader()
@@ -199,7 +224,7 @@ async function runPageRequest(input: PageRequestInput): Promise<AuthenticatedJso
         if (byteCount > input.maxResponseBytes) {
           await reader.cancel().catch(() => undefined)
           return {
-            _tag: "ResponseTooLarge",
+            kind: "ResponseTooLarge",
             status: response.status,
             maxResponseBytes: input.maxResponseBytes,
           }
@@ -211,16 +236,16 @@ async function runPageRequest(input: PageRequestInput): Promise<AuthenticatedJso
 
     try {
       return {
-        _tag: "Success",
+        kind: "Success",
         status: response.status,
         value: text ? JSON.parse(text) : null,
       }
     } catch {
-      return { _tag: "InvalidJson", status: response.status }
+      return { kind: "InvalidJson", status: response.status }
     }
-  } catch (cause) {
+  } catch {
     return {
-      _tag: "RequestFailed",
+      kind: "RequestFailed",
       outcome: requestStarted ? "unknown" : "not-sent",
     }
   } finally {

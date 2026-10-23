@@ -1,8 +1,8 @@
-import { Effect, Schema, Semaphore } from "effect"
-import fs from "node:fs/promises"
+import { Effect, Predicate, Schema, Semaphore } from "effect"
 import path from "node:path"
 import type { Page, Request, Response } from "playwright-core"
 import * as AuthProfile from "./auth-profile.ts"
+import { writeJsonFileAtomically } from "./fs-durability.ts"
 import { SecretCollector } from "./network-redaction.ts"
 
 export type NetworkCaptureOptions = {
@@ -35,6 +35,16 @@ export type NetworkCaptureStatus = {
   readonly secrets?: string
 }
 
+type NetworkEndpointDigest = {
+  readonly method: string
+  readonly url: string
+  readonly status?: number
+  readonly count: number
+  readonly requestHeaders?: readonly string[]
+  readonly requestKeys?: readonly string[]
+  readonly responseKeys?: readonly string[]
+}
+
 export type NetworkCaptureResult = NetworkCaptureStatus & {
   readonly active: false
   readonly stoppedAt: string
@@ -42,6 +52,7 @@ export type NetworkCaptureResult = NetworkCaptureStatus & {
   readonly authProfile?: AuthProfile.AuthProfileSummary
   readonly updatedSecretRefs: readonly string[]
   readonly observedSecretRefs: readonly string[]
+  readonly endpoints?: readonly NetworkEndpointDigest[]
 }
 
 export class NetworkCaptureError extends Schema.TaggedError<NetworkCaptureError>()(
@@ -208,7 +219,7 @@ export class Recorder {
     return this.transition.withPermit(Effect.gen(function* () {
       const active = capture.active
       if (!active) {
-        return yield* Effect.fail(new NetworkCaptureError({ message: "Network capture is not active for this session", operation: "stop", reason: "inactive" }))
+        return yield* new NetworkCaptureError({ message: "Network capture is not active for this session", operation: "stop", reason: "inactive" })
       }
       const boundPage = capture.page
       active.stopping = true
@@ -230,17 +241,19 @@ export class Recorder {
         const secrets = options.secrets
         const profileOptions = capture.recorderOptions.authProfileBaseDir ? { baseDir: capture.recorderOptions.authProfileBaseDir } : {}
         const finish = finishCapture(active, options, secrets, profileOptions)
-        const finished = yield* secrets
-          ? AuthProfile.withLock(secrets, profileOptions, finish).pipe(
-            Effect.mapError((cause) => cause instanceof NetworkCaptureError
-              ? cause
-              : new NetworkCaptureError({ message: cause.message, operation: "auth-profile", reason: "persistence-failed", cause })),
-          )
+        const finished = yield* (secrets
+          ? AuthProfile.withLock(secrets, profileOptions, finish)
           : finish
-        const finalStatus = statusForFinished(active, secrets)
+        ).pipe(
+          Effect.mapError((cause) => cause instanceof NetworkCaptureError
+            ? cause
+            : new NetworkCaptureError({ message: cause.message, operation: "auth-profile", reason: "persistence-failed", cause })),
+        )
+        const finalStatus = capture.status()
         capture.active = undefined
         return {
           ...finalStatus,
+          ...(secrets ? { secrets } : {}),
           truncatedBodyCount: finalStatus.truncatedBodyCount + finished.redactionOmissionCount,
           active: false as const,
           stoppedAt: new Date().toISOString(),
@@ -248,6 +261,7 @@ export class Recorder {
           ...(finished.authProfile ? { authProfile: finished.authProfile } : {}),
           updatedSecretRefs: finished.updatedSecretRefs,
           observedSecretRefs: finished.observedSecretRefs,
+          ...(finished.endpoints.length > 0 ? { endpoints: finished.endpoints } : {}),
         }
       }).pipe(
         Effect.tapError(() => Effect.sync(() => {
@@ -483,39 +497,33 @@ function finishCapture(
   readonly updatedSecretRefs: readonly string[]
   readonly observedSecretRefs: readonly string[]
   readonly redactionOmissionCount: number
-}, NetworkCaptureError> {
+  readonly endpoints: readonly NetworkEndpointDigest[]
+}, NetworkCaptureError | AuthProfile.AuthProfileError> {
   return Effect.gen(function* () {
     const existingProfile = secrets
-      ? yield* AuthProfile.readOptional(secrets, profileOptions).pipe(
-        Effect.mapError((cause) => new NetworkCaptureError({ message: cause.message, operation: "auth-profile", reason: "persistence-failed", cause })),
-      )
+      ? yield* AuthProfile.readOptional(secrets, profileOptions)
       : undefined
     const collector = new SecretCollector(existingProfile?.slots ?? [])
-    let protectedEntries: readonly CapturedEntry[] | undefined
-    if (options.outputPath) {
-      const structurallyProtected = active.entries.map((entry) => protectEntry(entry, collector))
-      protectedEntries = structurallyProtected.map((entry) => redactEntryKnownValues(entry, collector))
-    } else if (secrets) {
-      for (const entry of active.entries) protectEntry(entry, collector)
-    }
+    const structurallyProtected = active.entries.map((entry) => protectEntry(entry, collector))
+    const protectedEntries = options.outputPath
+      ? structurallyProtected.map((entry) => redactEntryKnownValues(entry, collector))
+      : structurallyProtected
     if (options.requireObservedSecrets && collector.observedRefs().length === 0) {
-      return yield* Effect.fail(new NetworkCaptureError({
+      return yield* new NetworkCaptureError({
         message: `Auth refresh did not observe credentials for profile ${secrets ?? "unknown"}`,
         operation: "auth-profile",
         reason: "persistence-failed",
-      }))
+      })
     }
     const authProfile = secrets
-      ? yield* AuthProfile.write({ name: secrets, slots: collector.slots(), ...profileOptions }).pipe(
-        Effect.mapError((cause) => new NetworkCaptureError({ message: cause.message, operation: "auth-profile", reason: "persistence-failed", cause })),
-      )
+      ? yield* AuthProfile.write({ name: secrets, slots: collector.slots(), ...profileOptions })
       : undefined
     if (options.outputPath) {
       yield* writeArtifact(options.outputPath, {
         log: {
           version: "1.2",
           creator: { name: "Browser Control", version: "1" },
-          entries: (protectedEntries ?? []).map(toHarEntry),
+          entries: protectedEntries.map(toHarEntry),
         },
       })
     }
@@ -523,9 +531,57 @@ function finishCapture(
       ...(authProfile ? { authProfile } : {}),
       updatedSecretRefs: collector.updatedRefs(),
       observedSecretRefs: collector.observedRefs(),
-      redactionOmissionCount: protectedEntries ? countRedactionOmissions(active.entries, protectedEntries) : 0,
+      redactionOmissionCount: options.outputPath ? countRedactionOmissions(active.entries, protectedEntries) : 0,
+      endpoints: summarizeEndpoints(protectedEntries),
     }
   })
+}
+
+function extractTopLevelJsonKeys(body: CapturedBody | undefined): readonly string[] | undefined {
+  if (!body?.text || !body.mimeType.toLowerCase().includes("json")) return undefined
+  try {
+    const parsed: unknown = JSON.parse(body.text)
+    if (Predicate.isObject(parsed) && !Array.isArray(parsed)) {
+      const keys = Object.keys(parsed).slice(0, 15)
+      return keys.length > 0 ? keys : undefined
+    }
+  } catch {}
+  return undefined
+}
+
+function summarizeEndpoints(entries: readonly CapturedEntry[]): readonly NetworkEndpointDigest[] {
+  const byRoute = new Map<string, NetworkEndpointDigest>()
+  for (const entry of entries) {
+    if (["image", "stylesheet", "font", "media"].includes(entry.request.resourceType)) continue
+    let routePath = entry.request.url
+    try {
+      const u = new URL(entry.request.url)
+      routePath = `${u.origin}${u.pathname}`
+    } catch {}
+    const key = `${entry.request.method} ${routePath}`
+    const existing = byRoute.get(key)
+    if (!existing && byRoute.size >= 30) continue
+    const notableHeaders = entry.request.headers
+      .filter((h) => {
+        const lower = h.name.toLowerCase()
+        if (lower === "x-client-data" || lower.startsWith("sec-ch-")) return false
+        return h.value.includes("${BC_SECRET_") || lower === "authorization" || lower.startsWith("x-")
+      })
+      .slice(0, 8)
+      .map((h) => `${h.name}: ${h.value.slice(0, 80)}`)
+    const requestKeys = existing?.requestKeys ? undefined : extractTopLevelJsonKeys(entry.request.body)
+    const responseKeys = existing?.responseKeys ? undefined : extractTopLevelJsonKeys(entry.response?.body)
+    byRoute.set(key, {
+      method: entry.request.method,
+      url: entry.request.url.slice(0, 240),
+      ...(entry.response ? { status: entry.response.status } : existing?.status !== undefined ? { status: existing.status } : {}),
+      count: (existing?.count ?? 0) + 1,
+      ...(notableHeaders.length > 0 ? { requestHeaders: notableHeaders } : existing?.requestHeaders ? { requestHeaders: existing.requestHeaders } : {}),
+      ...(requestKeys ? { requestKeys } : existing?.requestKeys ? { requestKeys: existing.requestKeys } : {}),
+      ...(responseKeys ? { responseKeys } : existing?.responseKeys ? { responseKeys: existing.responseKeys } : {}),
+    })
+  }
+  return [...byRoute.values()]
 }
 
 function countRedactionOmissions(original: readonly CapturedEntry[], protectedEntries: readonly CapturedEntry[]): number {
@@ -581,9 +637,13 @@ function captureBuffer(buffer: Buffer | null, mimeType: string | undefined, acti
 }
 
 function bodyCanFit(headers: readonly Header[], limit: number): boolean {
+  if (limit <= 0) return false
   const length = declaredBodySize(headers)
   const encoding = header(headers, "content-encoding")?.trim().toLowerCase()
-  return length !== undefined && length <= Math.max(0, limit) && (!encoding || encoding === "identity")
+  const supportedEncoding = !encoding || encoding === "identity" || encoding === "gzip" || encoding === "br" || encoding === "deflate" || encoding === "zstd"
+  if (!supportedEncoding) return false
+  if (length !== undefined) return length <= limit
+  return Boolean(encoding && isTextualMimeType(contentType(headers)))
 }
 
 function declaredBodySize(headers: readonly Header[]): number | undefined {
@@ -666,7 +726,7 @@ function redactStructuredBody(body: CapturedBody, collector: SecretCollector): C
 
 function redactKnownScalars(value: unknown, collector: SecretCollector): unknown {
   if (Array.isArray(value)) return value.map((item) => redactKnownScalars(item, collector))
-  if (value && typeof value === "object") {
+  if (Predicate.isObject(value)) {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactKnownScalars(item, collector)]))
   }
   return collector.redactExactValue(value, 8)
@@ -717,38 +777,9 @@ function toHarEntry(entry: CapturedEntry): Record<string, unknown> {
   }
 }
 
-function statusForFinished(active: ActiveCapture, secrets: string | undefined): Omit<NetworkCaptureStatus, "active"> {
-  return {
-    startedAt: active.startedAt,
-    entryCount: active.entries.length,
-    responseCount: active.entries.filter((entry) => entry.response).length,
-    failureCount: active.entries.filter((entry) => entry.failure).length,
-    capturedBodyBytes: active.capturedBodyBytes,
-    truncatedBodyCount: active.truncatedBodyCount,
-    droppedEntryCount: active.droppedEntryCount,
-    ...(active.options.urlFilter ? { urlFilter: active.options.urlFilter } : {}),
-    ...(active.options.resourceTypes ? { resourceTypes: [...active.options.resourceTypes] } : {}),
-    content: active.options.content,
-    ...(secrets ? { secrets } : {}),
-  }
-}
-
 function writeArtifact(outputPath: string, value: unknown): Effect.Effect<void, NetworkCaptureError> {
   return Effect.tryPromise({
-    try: async () => {
-      const absolutePath = path.resolve(outputPath)
-      await fs.mkdir(path.dirname(absolutePath), { recursive: true })
-      const temporaryPath = `${absolutePath}.${process.pid}.${crypto.randomUUID()}.tmp`
-      let renamed = false
-      try {
-        await fs.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
-        await fs.rename(temporaryPath, absolutePath)
-        renamed = true
-        await fs.chmod(absolutePath, 0o600)
-      } finally {
-        if (!renamed) await fs.rm(temporaryPath, { force: true }).catch(() => {})
-      }
-    },
+    try: () => writeJsonFileAtomically(path.resolve(outputPath), value),
     catch: (cause) => new NetworkCaptureError({ message: `Could not write network capture: ${outputPath}`, operation: "write", reason: "persistence-failed", cause }),
   })
 }
@@ -833,5 +864,3 @@ function queryString(rawUrl: string): Array<{ name: string; value: string }> {
 function isTextualMimeType(mimeType: string | undefined): boolean {
   return !mimeType || mimeType.startsWith("text/") || /json|javascript|xml|x-www-form-urlencoded|multipart\/form-data|graphql/.test(mimeType)
 }
-
-export * as NetworkCapture from "./network-capture.ts"

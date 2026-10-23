@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
-import { Deferred, Effect, Exit, Fiber, Latch, Scheduler } from "effect"
+import { Deferred, Effect, Exit, Fiber, Latch, Match, Result, Scheduler } from "effect"
 import { TestClock } from "effect/testing"
 import { adoptionTipForUrl, BrowserControlSessions, shouldAppendAdoptionTip } from "../src/session-manager.ts"
-import type { ExecuteSandboxLike, SessionTarget } from "../src/relay-types.ts"
+import { AuthenticatedJsonOutcome } from "../src/relay-schema.ts"
+import type { ConnectedTarget, ExecuteSandboxLike, SessionTarget } from "../src/relay-types.ts"
 import type { PersistedSession } from "../src/session-catalog.ts"
 import { TargetRegistry } from "../src/target-registry.ts"
 
@@ -71,11 +72,10 @@ const makeFakeSandbox = (options?: {
       ),
     authenticatedJson: (request) => options?.onAuthenticatedJson
       ? options.onAuthenticatedJson(request)
-      : Effect.succeed({
-          _tag: "Success",
+      : Effect.succeed(AuthenticatedJsonOutcome.cases.Success.make({
           status: 200,
           value: { ok: true },
-        }),
+        })),
     disconnectSettled: disconnect,
     closeSettled: close,
     networkStart: () => Effect.succeed({ active: true, entryCount: 0, responseCount: 0, failureCount: 0, capturedBodyBytes: 0, truncatedBodyCount: 0, droppedEntryCount: 0 }),
@@ -125,6 +125,115 @@ const makeFakeSandbox = (options?: {
 }
 
 describe("BrowserControlSessions", () => {
+  function tab(id: string, sessionId: string | undefined, owner: "relay" | "user" = "relay"): ConnectedTarget {
+    return {
+      tabId: id.length, sessionId: `cdp-${id}`, owner,
+      ...(sessionId ? { browserControlSessionId: sessionId } : {}),
+      targetInfo: { targetId: id, type: "page", title: id, url: "about:blank", attached: true, canAccessOpener: false },
+    }
+  }
+
+  it.each(["reset", "delete", "idle"] as const)("%s closes every session-created tab and preserves user/other-session tabs", async (operation) => {
+    const targets = [tab("default", "named"), tab("popup", "named"), tab("newPage", "named"), tab("user", "named", "user"), tab("other", "other"), tab("unowned", undefined, "user")]
+    const closed: string[] = []
+    const sandboxes: FakeSandbox[] = []
+    const sessions = new BrowserControlSessions("http://relay.test", (_id, onDefaultTargetChange) => {
+      const sandbox = makeFakeSandbox({ onDefaultTargetChange })
+      sandboxes.push(sandbox)
+      return sandbox
+    }, {
+      getTargets: () => targets,
+      onReleaseRelayTarget: (id) => Effect.sync(() => { closed.push(id) }),
+    })
+    const original = sessions.createNew("named")
+    original.target = { id: "default", owner: "relay" }
+    original.updatedAt = new Date(0).toISOString()
+    if (operation === "idle") {
+      expect(await Effect.runPromise(sessions.reapIdleRelaySessions({ maxIdleMs: 900_000, now: 900_001 }))).toEqual(["named"])
+    } else {
+      await Effect.runPromise(operation === "reset" ? sessions.reset("named").pipe(Effect.asVoid) : sessions.delete("named").pipe(Effect.asVoid))
+    }
+    expect(closed).toEqual(["default", "popup", "newPage"])
+    expect(sandboxes[0]?.closes()).toBe(1)
+    expect(sessions.sessions.get("named")?.sandbox).not.toBe(original.sandbox)
+    await Effect.runPromise(sessions.closeAll())
+  })
+
+  it("idle reap resets a state-only sandbox and respects busy secondary tabs", async () => {
+    const sandbox = makeFakeSandbox()
+    const targets = [tab("popup", "named")]
+    const sessions = new BrowserControlSessions("http://relay.test", () => sandbox, { getTargets: () => targets })
+    const session = sessions.createNew("named")
+    session.updatedAt = new Date(0).toISOString()
+    expect(await Effect.runPromise(sessions.reapIdleRelaySessions({ maxIdleMs: 100, now: 101, isTargetBusy: () => true }))).toEqual([])
+    targets.length = 0
+    expect(await Effect.runPromise(sessions.reapIdleRelaySessions({ maxIdleMs: 100, now: 101 }))).toEqual(["named"])
+    expect(sandbox.closes()).toBe(1)
+    await Effect.runPromise(sessions.closeAll())
+  })
+
+  it("idle reap deletes agent default sessions instead of keeping them forever", async () => {
+    const closed: string[] = []
+    const sessions = new BrowserControlSessions("http://relay.test", () => makeFakeSandbox(), {
+      getTargets: () => [tab("agent-tab", "oc-ses_agent")],
+      onReleaseRelayTarget: (id) => Effect.sync(() => { closed.push(id) }),
+    })
+    sessions.createNew("oc-ses_agent").updatedAt = new Date(0).toISOString()
+    sessions.createNew("named").updatedAt = new Date(0).toISOString()
+    expect(await Effect.runPromise(sessions.reapIdleRelaySessions({ maxIdleMs: 100, now: 101 }))).toEqual(["oc-ses_agent", "named"])
+    expect(closed).toEqual(["agent-tab"])
+    expect(sessions.sessions.has("oc-ses_agent")).toBe(false)
+    expect(sessions.sessions.has("named")).toBe(true)
+    await Effect.runPromise(sessions.closeAll())
+  })
+
+  it("orphan sweep closes only positively owned relay targets without a session", async () => {
+    const closed: string[] = []
+    const sessions = new BrowserControlSessions("http://relay.test", () => makeFakeSandbox(), {
+      getTargets: () => [tab("orphan", "gone"), tab("live", "live"), tab("user", "gone", "user"), tab("raw", undefined)],
+      onReleaseRelayTarget: (id) => Effect.sync(() => { closed.push(id) }),
+    })
+    sessions.createNew("live")
+    await Effect.runPromise(sessions.sweepOrphanedRelayTargets())
+    expect(closed).toEqual(["orphan"])
+    await Effect.runPromise(sessions.closeAll())
+  })
+
+  it.each(["success", "setup", "script"] as const)("one-shot execute cleans all tabs after %s", async (outcome) => {
+    const closed: string[] = []
+    const targets: ConnectedTarget[] = []
+    const sessions = new BrowserControlSessions("http://relay.test", (id) => {
+      targets.push(tab("first", id), tab("extra", id))
+      const sandbox = makeFakeSandbox(outcome === "setup" ? { setupFailure: new Error("setup failed") } : {})
+      return outcome === "script" ? { ...sandbox, execute: () => sandbox.execute("").pipe(Effect.map((result) => ({ ...result, isError: true, text: "script failed" }))) } : sandbox
+    }, {
+      getTargets: () => targets,
+      onReleaseRelayTarget: (id) => Effect.sync(() => { closed.push(id) }),
+    })
+    const result = await Effect.runPromise(sessions.execute({ code: "return 1", createIfMissing: true, removeAfterExecute: true }).pipe(Effect.result))
+    expect(result._tag).toBe(outcome === "setup" ? "Failure" : "Success")
+    expect(closed).toEqual(["first", "extra"])
+    expect(sessions.listSummaries()).toEqual([])
+  })
+
+  it("one-shot cleanup survives a caller disconnect during execution", async () => {
+    await Effect.runPromise(Effect.gen(function* () {
+      const started = yield* Latch.make()
+      const release = yield* Latch.make()
+      const closed = yield* Latch.make()
+      const sessions = new BrowserControlSessions("http://relay.test", () => makeFakeSandbox({
+        onExecute: started.open.pipe(Effect.andThen(release.await)),
+        onClose: closed.open,
+      }))
+      const caller = yield* sessions.execute({ code: "return 1", createIfMissing: true, removeAfterExecute: true }).pipe(Effect.forkChild)
+      yield* started.await
+      yield* Fiber.interrupt(caller)
+      yield* release.open
+      yield* closed.await
+      expect(sessions.listSummaries()).toEqual([])
+      yield* sessions.closeAll()
+    }))
+  })
   it("concurrent ensure does not acknowledge a creation whose catalog commit fails", async () => {
     const started = Latch.makeUnsafe(false)
     const release = Latch.makeUnsafe(false)
@@ -315,7 +424,7 @@ describe("BrowserControlSessions", () => {
       method: "GET",
       path: "/api/live/get-broadcasts",
     }))
-    expect(result).toEqual({ _tag: "Success", status: 200, value: { ok: true } })
+    expect(result).toEqual(AuthenticatedJsonOutcome.cases.Success.make({ status: 200, value: { ok: true } }))
     expect(records).toEqual([])
   })
 
@@ -324,7 +433,7 @@ describe("BrowserControlSessions", () => {
     const sessions = new BrowserControlSessions("http://127.0.0.1:0", () => makeFakeSandbox({
       onAuthenticatedJson: () => Effect.sync(() => {
         requests += 1
-        return { _tag: "Success", status: 200, value: null } as const
+        return AuthenticatedJsonOutcome.cases.Success.make({ status: 200, value: null })
       }),
     }))
     await Effect.runPromise(sessions.ensure("inspect", { readOnly: true }))
@@ -1744,11 +1853,12 @@ describe("BrowserControlSessions", () => {
       yield* executeStarted.await
       yield* Fiber.interrupt(execute)
 
-      const next = operation === "execute"
-        ? sessions.execute({ sessionId: "alpha", code: "next", createIfMissing: false }).pipe(Effect.asVoid)
-        : operation === "reset"
-        ? sessions.reset("alpha").pipe(Effect.asVoid)
-        : sessions.delete("alpha").pipe(Effect.asVoid)
+      const next = Match.value(operation).pipe(
+        Match.when("execute", () => sessions.execute({ sessionId: "alpha", code: "next", createIfMissing: false }).pipe(Effect.asVoid)),
+        Match.when("reset", () => sessions.reset("alpha").pipe(Effect.asVoid)),
+        Match.when("delete", () => sessions.delete("alpha").pipe(Effect.asVoid)),
+        Match.exhaustive,
+      )
       const queued = yield* Effect.forkChild(next, { startImmediately: true })
       const drain = yield* Effect.forkChild(sessions.beginDrain(), { startImmediately: true })
       expect(sessions.hasPendingWork("alpha")).toBe(true)
@@ -1991,8 +2101,8 @@ describe("BrowserControlSessions", () => {
       yield* Deferred.succeed(release, undefined)
       expect((yield* Fiber.join(alpha)).session.id).toBe("alpha")
       const betaResult = yield* Effect.result(Fiber.join(beta))
-      expect(betaResult._tag).toBe("Failure")
-      if (betaResult._tag === "Failure") {
+      expect(Result.isFailure(betaResult)).toBe(true)
+      if (Result.isFailure(betaResult)) {
         expect(betaResult.failure.message).toBe("Target is already adopted by session alpha. Use that session, or reset/delete it to release the tab before adopting it elsewhere.")
       }
 

@@ -18,8 +18,9 @@ export async function prepareBuildOutput(root: string, defaultOutput: string, re
     await fs.mkdir(output, { recursive: true })
     return output
   }
-  if (output === root || root.startsWith(`${output}${path.sep}`) || output.startsWith(`${root}${path.sep}`)) {
-    throw new Error("Alternate build output must be a fresh directory outside the source checkout")
+  if (!path.isAbsolute(requested)) throw new Error(`Use an absolute --outdir: ${requested}`)
+  if (output === root || output.startsWith(`${root}${path.sep}`)) {
+    throw new Error(`--outdir must be outside the checkout: ${output}`)
   }
   await fs.mkdir(output)
   return output

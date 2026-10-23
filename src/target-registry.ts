@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import type { JsonObject, TargetInfo } from "./protocol.ts"
+import { isJsonObject, type JsonObject, type TargetInfo } from "./protocol.ts"
 import type { ChildTarget, ConnectedTarget, StoredFrameEvents } from "./relay-types.ts"
 
 export type TargetOwnershipReservation = {
@@ -134,22 +134,7 @@ export class TargetRegistry {
       existingForTab.sessionId !== target.sessionId ||
       existingForTab.targetInfo.targetId !== target.targetInfo.targetId
     )
-    const pendingReservation = existingForTab
-      ? this.pendingOwnershipReservations.get(existingForTab.targetInfo.targetId)
-      : undefined
-    const inheritedBrowserControlSessionId = pendingReservation
-      ? pendingReservation.previousBrowserControlSessionId
-      : existingForTab?.browserControlSessionId
-    const { browserControlSessionId: _incomingOwner, ...targetWithoutOwner } = target
-    const nextTarget = generationChanged
-      ? {
-          ...targetWithoutOwner,
-          owner: existingForTab.owner,
-          ...(inheritedBrowserControlSessionId
-            ? { browserControlSessionId: inheritedBrowserControlSessionId }
-            : {}),
-        }
-      : target
+    const nextTarget = generationChanged ? this.inheritRootOwnership(target, existingForTab) : target
     const detached = generationChanged
       ? this.detachRootTargetState(target.tabId, options)
       : undefined
@@ -173,23 +158,23 @@ export class TargetRegistry {
 
   stageRootTarget(target: ConnectedTarget): ConnectedTarget {
     const existing = this.tabTargets.get(target.tabId)
-    const pendingReservation = existing
-      ? this.pendingOwnershipReservations.get(existing.targetInfo.targetId)
-      : undefined
-    const inheritedBrowserControlSessionId = pendingReservation
-      ? pendingReservation.previousBrowserControlSessionId
-      : existing?.browserControlSessionId
-    const { browserControlSessionId: _incomingOwner, ...targetWithoutOwner } = target
-    const staged = existing
-      ? {
-          ...targetWithoutOwner,
-          owner: existing.owner,
-          ...(inheritedBrowserControlSessionId ? { browserControlSessionId: inheritedBrowserControlSessionId } : {}),
-        }
-      : target
+    const staged = existing ? this.inheritRootOwnership(target, existing) : target
     this.stagedRootTargets.set(target.tabId, staged)
     this.tabFrameEvents.delete(target.tabId)
     return staged
+  }
+
+  private inheritRootOwnership(target: ConnectedTarget, existing: ConnectedTarget): ConnectedTarget {
+    const pendingReservation = this.pendingOwnershipReservations.get(existing.targetInfo.targetId)
+    const inheritedBrowserControlSessionId = pendingReservation
+      ? pendingReservation.previousBrowserControlSessionId
+      : existing.browserControlSessionId
+    const { browserControlSessionId: _incomingOwner, ...targetWithoutOwner } = target
+    return {
+      ...targetWithoutOwner,
+      owner: existing.owner,
+      ...(inheritedBrowserControlSessionId ? { browserControlSessionId: inheritedBrowserControlSessionId } : {}),
+    }
   }
 
   stagedRootTarget(tabId: number): ConnectedTarget | undefined {
@@ -406,7 +391,7 @@ export class TargetRegistry {
       return undefined
     }
     this.updateRootTargetInfo(options.tabId, options.targetInfo)
-    const target = this.tabTargets.get(options.tabId)
+    const target = this.routingRootTarget(options.tabId)
     return target ? { kind: "root", target } : undefined
   }
 
@@ -420,11 +405,8 @@ export class TargetRegistry {
     if (!target) {
       return
     }
-    const updated: ConnectedTarget = { ...target, targetInfo }
-    this.targets.set(updated.sessionId, updated)
-    this.tabTargets.set(tabId, updated)
     this.targetsByTargetId.delete(target.targetInfo.targetId)
-    this.targetsByTargetId.set(targetInfo.targetId, updated)
+    this.addRootTarget({ ...target, targetInfo })
   }
 
   updateChildTargetInfo(targetInfo: TargetInfo): void {
@@ -461,22 +443,14 @@ export class TargetRegistry {
     readonly isRestrictedTarget: (targetInfo: TargetInfo) => boolean
     readonly isVisibleTarget?: (target: ConnectedTarget | ChildTarget) => boolean
   }): TargetInfo[] {
-    return [...this.targets.values(), ...this.childTargets.values()]
-      .filter((target) => {
-        return options.isVisibleTarget?.(target) ?? true
-      })
-      .map((target) => {
-        return target.targetInfo
-      })
-      .filter((targetInfo) => {
-        return !options.isRestrictedTarget(targetInfo)
-      })
-      .map((targetInfo) => {
-        return { ...targetInfo, attached: true }
-      })
+    return [...this.targets.values(), ...this.childTargets.values()].flatMap((target) => {
+      if (!(options.isVisibleTarget?.(target) ?? true)) return []
+      if (options.isRestrictedTarget(target.targetInfo)) return []
+      return [{ ...target.targetInfo, attached: true }]
+    })
   }
 
-  findFrameEventsForChild(target: ChildTarget, getObject: (value: unknown) => JsonObject | undefined): StoredFrameEvents | undefined {
+  findFrameEventsForChild(target: ChildTarget): StoredFrameEvents | undefined {
     const frameEvents = this.tabFrameEvents.get(target.tabId)
     if (!frameEvents) {
       return undefined
@@ -486,7 +460,7 @@ export class TargetRegistry {
       return exactMatch
     }
     return Array.from(frameEvents.values()).find((candidate) => {
-      const frame = getObject(candidate.navigated?.frame)
+      const frame = isJsonObject(candidate.navigated?.frame) ? candidate.navigated.frame : undefined
       if (!frame) {
         return false
       }

@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url"
-import { Context, Effect, Layer, Redacted, Schema } from "effect"
-import { FetchHttpClient } from "effect/http"
+import { NodeHttpClient } from "@effect/platform-node"
+import { Context, Effect, Layer, Match, Redacted, Schema } from "effect"
 import * as AuthenticatedOriginInternal from "./authenticated-origin.ts"
 import * as RelayClient from "./relay-client.ts"
 import * as RelayLifecycle from "./relay-lifecycle.ts"
@@ -93,9 +93,12 @@ export type Error =
 export interface JsonOptions<S extends Schema.Top> {
   readonly path: `/${string}`
   readonly method?: AuthenticatedJsonMethod
+  readonly headers?: Readonly<Record<string, string>>
   readonly body?: Json
   readonly response: S
   readonly sensitive?: boolean
+  readonly handoffOnAuthFailure?: boolean
+  readonly handoffMessage?: string
   readonly timeoutMs?: number
   readonly maxResponseBytes?: number
 }
@@ -121,6 +124,32 @@ export interface AuthenticatedOriginOptions {
   readonly origin: string
   /** Explicitly navigate here when the session page is not already on `origin`. */
   readonly startUrl?: string
+  /** Default headers merged into every request on this origin. */
+  readonly headers?: Readonly<Record<string, string>>
+  /** Present an in-page handoff prompt and retry once if the session is logged out or redirected to auth. */
+  readonly handoffOnAuthFailure?: boolean
+  readonly handoffMessage?: string
+}
+
+export interface OriginClientOptions extends Omit<AuthenticatedOriginOptions, "origin"> {
+  readonly session: string
+  readonly readOnly?: boolean
+  readonly endpoint?: string
+}
+
+export interface OriginClient {
+  readonly origin: string
+  readonly session: string
+  readonly get: <T = unknown>(
+    path: `/${string}`,
+    options?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number },
+  ) => Promise<T>
+  readonly post: <T = unknown>(
+    path: `/${string}`,
+    body?: Json,
+    options?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number },
+  ) => Promise<T>
+  readonly json: AuthenticatedOriginCapability["json"]
 }
 
 export interface Session {
@@ -153,7 +182,7 @@ export class Service extends Context.Service<Service, Interface>()(
 
 export const make = Effect.fn("BrowserControlClient.make")(function* (options: MakeOptions = {}) {
   const relay = yield* RelayClient.make(options).pipe(
-    Effect.provide(FetchHttpClient.layer),
+    Effect.provide(NodeHttpClient.layerNodeHttp),
     Effect.mapError((error) => clientError("connect", error)),
   )
   const readiness = yield* RelayLifecycle.ensureRelay({
@@ -162,10 +191,10 @@ export const make = Effect.fn("BrowserControlClient.make")(function* (options: M
     start: RelayLifecycle.startManagedRelay(fileURLToPath(import.meta.url), "node", []),
   }).pipe(Effect.mapError((error) => clientError("connect", error)))
   if (readiness.buildProblem) {
-    return yield* Effect.fail(new ClientError({
+    return yield* new ClientError({
       message: readiness.buildProblem,
       reason: "connect",
-    }))
+    })
   }
   yield* RelayLifecycle.ensureExtensionConnected({
     relay,
@@ -194,6 +223,64 @@ export const make = Effect.fn("BrowserControlClient.make")(function* (options: M
 export const layer = (options: MakeOptions = {}): Layer.Layer<Service, ClientError> =>
   Layer.effect(Service, make(options))
 
+export function origin(originUrl: string, options: OriginClientOptions): OriginClient {
+  const normalizedOrigin = AuthenticatedOriginInternal.normalizeOrigin(originUrl)
+  let cachedOrigin: Promise<AuthenticatedOriginCapability> | undefined
+  const resolveOrigin = (): Promise<AuthenticatedOriginCapability> => {
+    cachedOrigin ??= Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* make(options.endpoint ? { endpoint: options.endpoint } : {})
+        const liveSession = yield* client.ensureSession({
+          id: options.session,
+          ...(options.readOnly === undefined ? {} : { readOnly: options.readOnly }),
+        })
+        return yield* liveSession.authenticatedOrigin({
+          origin: normalizedOrigin,
+          startUrl: options.startUrl ?? "/",
+          ...(options.headers ? { headers: options.headers } : {}),
+          ...(options.handoffOnAuthFailure === undefined ? {} : { handoffOnAuthFailure: options.handoffOnAuthFailure }),
+          ...(options.handoffMessage ? { handoffMessage: options.handoffMessage } : {}),
+        })
+      }),
+    ).catch((error) => {
+      cachedOrigin = undefined
+      throw error
+    })
+    return cachedOrigin
+  }
+  const json: AuthenticatedOriginCapability["json"] = ((request: JsonOptions<Schema.Top>) =>
+    Effect.promise(resolveOrigin).pipe(
+      Effect.flatMap((cap) => cap.json(request as JsonOptions<Schema.Top> & { readonly sensitive?: false })),
+    )) as AuthenticatedOriginCapability["json"]
+
+  return {
+    origin: normalizedOrigin,
+    session: options.session,
+    get: async <T = unknown>(path: `/${string}`, callOptions?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number }) => {
+      const cap = await resolveOrigin()
+      return (await Effect.runPromise(cap.json({
+        path,
+        method: "GET",
+        ...(callOptions?.headers ? { headers: callOptions.headers } : {}),
+        ...(callOptions?.timeoutMs === undefined ? {} : { timeoutMs: callOptions.timeoutMs }),
+        response: Schema.Json,
+      }))) as T
+    },
+    post: async <T = unknown>(path: `/${string}`, body?: Json, callOptions?: { readonly headers?: Readonly<Record<string, string>>; readonly timeoutMs?: number }) => {
+      const cap = await resolveOrigin()
+      return (await Effect.runPromise(cap.json({
+        path,
+        method: "POST",
+        ...(body === undefined ? {} : { body }),
+        ...(callOptions?.headers ? { headers: callOptions.headers } : {}),
+        ...(callOptions?.timeoutMs === undefined ? {} : { timeoutMs: callOptions.timeoutMs }),
+        response: Schema.Json,
+      }))) as T
+    },
+    json,
+  }
+}
+
 function makeSession(relay: RelayClient.Interface, summary: SessionSummary): Session {
   return {
     id: summary.id,
@@ -216,13 +303,7 @@ function makeAuthenticatedOrigin(
   options: AuthenticatedOriginOptions,
 ): AuthenticatedOrigin {
   const origin = AuthenticatedOriginInternal.normalizeOrigin(options.origin)
-  const startUrl = options.startUrl === undefined ? undefined : new URL(options.startUrl, origin)
-  if (startUrl && startUrl.origin !== origin) {
-    throw new ClientError({
-      message: `Authenticated origin startUrl must stay on ${origin}`,
-      reason: "invalid-request",
-    })
-  }
+  const startUrl = options.startUrl === undefined ? undefined : AuthenticatedOriginInternal.resolveStartUrl(origin, options.startUrl)
 
   function json<S extends Schema.Top>(
     request: JsonOptions<S> & { readonly sensitive: true },
@@ -241,14 +322,23 @@ function makeAuthenticatedOrigin(
       }))
     }
     const mutation = method !== "GET"
+    const mergedHeaders =
+      options.headers || request.headers
+        ? { ...(options.headers ?? {}), ...(request.headers ?? {}) }
+        : undefined
+    const handoffOnAuthFailure = request.handoffOnAuthFailure ?? options.handoffOnAuthFailure
+    const handoffMessage = request.handoffMessage ?? options.handoffMessage
     return relay.authenticatedJson({
       sessionId,
       origin,
-      ...(startUrl ? { startUrl: startUrl.toString() } : {}),
+      ...(startUrl ? { startUrl } : {}),
       method,
       path: request.path,
+      ...(mergedHeaders ? { headers: mergedHeaders } : {}),
       ...(request.body === undefined ? {} : { body: request.body }),
       ...(request.sensitive === true ? { sensitive: true } : {}),
+      ...(handoffOnAuthFailure === undefined ? {} : { handoffOnAuthFailure }),
+      ...(handoffMessage === undefined ? {} : { handoffMessage }),
       ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
       ...(request.maxResponseBytes === undefined ? {} : { maxResponseBytes: request.maxResponseBytes }),
     }).pipe(
@@ -270,8 +360,8 @@ function decodeOutcome<S extends Schema.Top>(
   mutation: boolean,
   request: JsonOptions<S>,
 ): Effect.Effect<S["Type"] | Redacted.Redacted<S["Type"]>, Error, S["DecodingServices"]> {
-  switch (outcome._tag) {
-    case "Success": {
+  return Match.valueTags(outcome, {
+    Success: (outcome) => {
       if (request.sensitive === true) {
         return Schema.decodeUnknownEffect(Schema.RedactedFromValue(request.response, {
           label: "Browser Control authenticated response",
@@ -287,45 +377,45 @@ function decodeOutcome<S extends Schema.Top>(
           ? unknownOutcome(method)
           : new ResponseDecodeFailed({ message: `Authenticated response did not match the expected schema: ${cause.message}` })),
       )
-    }
-    case "OriginMismatch":
-      return Effect.fail(new OriginMismatch({
+    },
+    OriginMismatch: (outcome) =>
+      Effect.fail(new OriginMismatch({
         expectedOrigin: outcome.expectedOrigin,
         actualOrigin: outcome.actualOrigin,
         message: `Session page origin ${outcome.actualOrigin} does not match ${outcome.expectedOrigin}`,
-      }))
-    case "HttpError":
-      return Effect.fail(new HttpError({
+      })),
+    HttpError: (outcome) =>
+      Effect.fail(new HttpError({
         status: outcome.status,
         method,
         message: `Authenticated ${method} request was rejected with HTTP ${outcome.status}`,
-      }))
-    case "RequestFailed":
-      return Effect.fail(mutation || outcome.outcome === "unknown"
+      })),
+    RequestFailed: (outcome) =>
+      Effect.fail(mutation || outcome.outcome === "unknown"
         ? unknownOutcome(method)
-        : new RequestFailed({ method, message: `Authenticated ${method} request failed before it was sent` }))
-    case "InvalidJson":
-      return Effect.fail(mutation
+        : new RequestFailed({ method, message: `Authenticated ${method} request failed before it was sent` })),
+    InvalidJson: (outcome) =>
+      Effect.fail(mutation
         ? unknownOutcome(method)
         : new InvalidResponse({
             reason: "invalid-json",
             status: outcome.status,
             message: "Authenticated response was not valid JSON",
-          }))
-    case "ResponseTooLarge":
-      return Effect.fail(mutation
+          })),
+    ResponseTooLarge: (outcome) =>
+      Effect.fail(mutation
         ? unknownOutcome(method)
         : new InvalidResponse({
             reason: "too-large",
             status: outcome.status,
             maxResponseBytes: outcome.maxResponseBytes,
             message: `Authenticated response exceeded ${outcome.maxResponseBytes} bytes`,
-          }))
-    case "SensitiveCaptureActive":
-      return Effect.fail(new SensitiveCaptureActive({
+          })),
+    SensitiveCaptureActive: () =>
+      Effect.fail(new SensitiveCaptureActive({
         message: "Sensitive authenticated requests are blocked while session network capture is active",
-      }))
-  }
+      })),
+  })
 }
 
 function unknownOutcome(method: AuthenticatedJsonMethod): RequestOutcomeUnknown {

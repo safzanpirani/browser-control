@@ -298,8 +298,9 @@ export const prepareRuntime = Effect.fn("RuntimeInstall.prepare")(function* (
   const skill = yield* attempt(() => fs.readFile(path.join(installedPackage, "skills", "browser-control", "SKILL.md"), "utf8"))
   if (!skill.trim() || (yield* run(cli, ["skill"], install)).trim() !== skill.trim()) return yield* Effect.fail(new Error("CLI skill mismatch"))
   yield* run("node", ["--input-type=module", "--eval", `import { BrowserControlClient, AuthenticatedOrigin, SecretProfile } from '${packageName}'; if (!BrowserControlClient.Service || !AuthenticatedOrigin.reveal || !SecretProfile.run || !SecretProfile.Error) throw new Error('SDK exports missing')`], install)
+  yield* run("node", ["--input-type=module", "--eval", `import plugin, { extensionDirectory, mcpServerConfig, skillDefinition } from '${packageName}/server'; const config = mcpServerConfig(); const skill = await skillDefinition(); if (plugin.id !== 'browser-control' || config.command[0] !== 'node' || config.command[1] !== ${JSON.stringify(path.join(installedPackage, "dist", "mcp.js"))} || config.command.length !== 2 || extensionDirectory() !== ${JSON.stringify(path.join(installedPackage, "extension", "dist"))} || skill.id !== 'browser' || skill.location !== ${JSON.stringify(path.join(installedPackage, "skills", "browser-control", "SKILL.md"))} || !skill.content.includes('# Browser Control') || !skill.content.includes(extensionDirectory())) throw new Error('OpenCode plugin export invalid')`], install)
   const consumer = path.join(install, "validate-sdk.mts")
-  yield* attempt(() => fs.writeFile(consumer, `import { BrowserControlClient, AuthenticatedOrigin, SecretProfile } from '${packageName}'\nvoid [BrowserControlClient.Service, AuthenticatedOrigin.reveal, SecretProfile.run, SecretProfile.Error]\n`, { flag: "wx" }))
+  yield* attempt(() => fs.writeFile(consumer, `import { BrowserControlClient, AuthenticatedOrigin, SecretProfile } from '${packageName}'\nimport plugin, { extensionDirectory, mcpServerConfig, skillDefinition } from '${packageName}/server'\nvoid [BrowserControlClient.Service, AuthenticatedOrigin.reveal, SecretProfile.run, SecretProfile.Error, plugin.id, mcpServerConfig().command, extensionDirectory(), skillDefinition()]\n`, { flag: "wx" }))
   yield* run(path.join(staging, "node_modules", ".bin", "tsc"), [
     "--noEmit", "--strict", "--module", "NodeNext", "--target", "ES2022", "--types", "node",
     "--typeRoots", path.join(staging, "node_modules", "@types"), consumer,
@@ -333,6 +334,27 @@ export const selectRuntime = Effect.fn("RuntimeInstall.select")(function* (optio
       await fs.rename(temporary, active)
     } finally {
       await fs.rm(temporary, { force: true })
+    }
+    const extensionSource = path.join(install, "node_modules", packageName, "extension", "dist")
+    const repoExtensionDist = path.join(root, "extension", "dist")
+    await fs.cp(extensionSource, repoExtensionDist, { recursive: true, force: true }).catch(() => {})
+    const extensionsRoot = path.join(path.dirname(active), "extensions")
+    const entries = await fs.readdir(extensionsRoot, { withFileTypes: true }).catch(() => [])
+    let syncedExtensions = 1
+    for (const entry of entries) {
+      if (entry.isDirectory() && entry.name.startsWith("browser-control-")) {
+        await fs.cp(extensionSource, path.join(extensionsRoot, entry.name), { recursive: true, force: true })
+        syncedExtensions += 1
+      }
+    }
+    if (syncedExtensions > 0) {
+      const port = Number(process.env.BROWSER_CONTROL_PORT) || 19989
+      await fetch(`http://127.0.0.1:${port}/extension/reload`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+        signal: AbortSignal.timeout(2_500),
+      }).catch(() => {})
     }
   })
   return { install, active }

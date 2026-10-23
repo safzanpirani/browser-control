@@ -12,6 +12,7 @@ type AttachOptions = {
   readonly tabId: number
   readonly owner: "relay" | "user"
   readonly browserControlSessionId?: string
+  readonly expectedTargetId?: string
   readonly alreadyAttached?: boolean
   readonly expectedExtensionGeneration?: number
   readonly autoAttachParams?: JsonObject
@@ -104,6 +105,9 @@ export class RootTargetLifecycle {
     readonly verificationRetries: number
     readonly errorMessage: string
     readonly generation?: number
+    readonly owner?: "relay" | "user"
+    readonly browserControlSessionId?: string
+    readonly expectedTargetId?: string
   }): void {
     if (this.closing) return
     const lifecycle = this
@@ -136,11 +140,17 @@ export class RootTargetLifecycle {
       const mayAttach = worker.attachIfMissing
       worker.attachIfMissing = false
       yield* Effect.suspend(() => {
-        if (revision !== work.revision) return Effect.fail(new GenerationChanged({ message: "Tab detached during root reconciliation" }))
+        if (revision !== work.revision) return new GenerationChanged({ message: "Tab detached during root reconciliation" })
         return lifecycle.withPermit(options.tabId, generation, (transition) => {
           if (lifecycle.options.registry.routingRootTarget(options.tabId)) return lifecycle.reconcileUnlocked(transition)
           return mayAttach
-            ? lifecycle.attachUnlocked(transition, { tabId: options.tabId, owner: "user", alreadyAttached: true }).pipe(Effect.asVoid)
+            ? lifecycle.attachUnlocked(transition, {
+              tabId: options.tabId,
+              owner: options.owner ?? "user",
+              alreadyAttached: true,
+              ...(options.browserControlSessionId ? { browserControlSessionId: options.browserControlSessionId } : {}),
+              ...(options.expectedTargetId ? { expectedTargetId: options.expectedTargetId } : {}),
+            }).pipe(Effect.asVoid)
             : Effect.void
         })
       }).pipe(
@@ -236,7 +246,7 @@ export class RootTargetLifecycle {
       transition.generation !== extension.generation() || transition.revision !== transition.work.revision ||
       transition.root?.sessionId !== root?.sessionId || transition.root?.targetInfo.targetId !== root?.targetInfo.targetId ||
       transition.staged?.sessionId !== staged?.sessionId || transition.staged?.targetInfo.targetId !== staged?.targetInfo.targetId
-    ) return yield* Effect.fail(new GenerationChanged({ message: "Root target generation changed during reconciliation" }))
+    ) return yield* new GenerationChanged({ message: "Root target generation changed during reconciliation" })
   })
 
   private step<A>(transition: Transition, effect: Effect.Effect<A, Error>): Effect.Effect<A, Error> {
@@ -256,6 +266,7 @@ export class RootTargetLifecycle {
     if (!options.alreadyAttached) yield* this.step(transition, this.options.extension.send({ method: "debugger.attach", params: { tabId } }))
     yield* this.command(transition, "Page.enable")
     yield* Effect.gen({ self: this }, function* () {
+      yield* this.command(transition, "Emulation.setFocusEmulationEnabled", { enabled: false })
       yield* this.command(transition, "Page.addScriptToEvaluateOnNewDocument", { source: ghostCursorClientSource })
       yield* this.command(transition, "Runtime.evaluate", { expression: ghostCursorClientSource })
     }).pipe(Effect.ignore)
@@ -263,13 +274,14 @@ export class RootTargetLifecycle {
     const result = yield* this.command(transition, "Target.getTargetInfo")
     const targetInfo = getTargetInfo(result.targetInfo)
     if (!targetInfo) return yield* Effect.fail(new Error("Target.getTargetInfo did not return targetInfo"))
-    const restored = options.browserControlSessionId ? undefined : this.options.sessions.persistedTargetOwner(targetInfo.targetId)
-    const browserControlSessionId = options.browserControlSessionId ?? restored?.sessionId
+    const matchesStoredIdentity = !options.expectedTargetId || options.expectedTargetId === targetInfo.targetId
+    const restored = this.options.sessions.persistedTargetOwner(targetInfo.targetId)
+    const browserControlSessionId = restored?.sessionId ?? (matchesStoredIdentity ? options.browserControlSessionId : undefined)
     const target = this.options.registry.stageRootTarget({
       tabId,
       sessionId: `bc-tab-${this.nextSessionId++}`,
       targetInfo,
-      owner: restored?.owner ?? options.owner,
+      owner: restored?.owner ?? (matchesStoredIdentity ? options.owner : "user"),
       ...(browserControlSessionId ? { browserControlSessionId } : {}),
     })
     transition.staged = target
@@ -293,7 +305,14 @@ export class RootTargetLifecycle {
       yield* this.finish(transition, staged)
       return
     }
-    if (!staged && expected?.targetInfo.targetId === targetInfo.targetId) return
+    if (!staged && expected?.targetInfo.targetId === targetInfo.targetId) {
+      yield* Effect.gen({ self: this }, function* () {
+        yield* this.command(transition, "Page.enable")
+        yield* this.command(transition, "Page.setLifecycleEventsEnabled", { enabled: true })
+        yield* this.command(transition, "Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true })
+      }).pipe(Effect.ignore)
+      return
+    }
     const owner = expected ?? staged
     if (!owner) return
     yield* this.attachUnlocked(transition, {
@@ -334,7 +353,10 @@ export class RootTargetLifecycle {
         presentation.announceChild(change.target.sessionId, child)
       }
     }
-    yield* this.step(transition, this.options.extension.send({ method: "action.setAttached", params: { tabId: target.tabId, attached: true } }).pipe(Effect.ignore))
+    yield* this.step(transition, this.options.extension.send({ method: "action.setAttached", params: {
+      tabId: target.tabId, attached: true, owner: target.owner, targetId: target.targetInfo.targetId,
+      ...(target.browserControlSessionId ? { browserControlSessionId: target.browserControlSessionId } : {}),
+    } }).pipe(Effect.ignore))
     return change.target
   })
 }

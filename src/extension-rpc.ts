@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Predicate } from "effect"
 import { WebSocket } from "ws"
 import {
   extensionProtocolCompatibility,
@@ -51,14 +51,8 @@ export class ExtensionRpc {
 
   replaceSocket(socket: WebSocket): void {
     this.rejectPending(new Error("Extension replaced"))
-    this.cancelLivenessProbe()
     this.socket?.close(4001, "Extension replaced")
-    this.socket = socket
-    this.ready = false
-    this.version = undefined
-    this.protocolVersion = undefined
-    this.protocolCompatible = undefined
-    this.protocolLegacy = undefined
+    this.resetConnectionState(socket)
   }
 
   markHandshake(version: string | undefined, reportedProtocolVersion: JsonValue | undefined): ExtensionProtocolCompatibility {
@@ -80,15 +74,19 @@ export class ExtensionRpc {
     if (this.socket !== socket) {
       return false
     }
-    this.socket = undefined
+    this.resetConnectionState(undefined)
+    this.rejectPending(new Error("Extension disconnected"))
+    return true
+  }
+
+  private resetConnectionState(socket: WebSocket | undefined): void {
+    this.cancelLivenessProbe()
+    this.socket = socket
     this.ready = false
     this.version = undefined
     this.protocolVersion = undefined
     this.protocolCompatible = undefined
     this.protocolLegacy = undefined
-    this.cancelLivenessProbe()
-    this.rejectPending(new Error("Extension disconnected"))
-    return true
   }
 
   close(): void {
@@ -141,6 +139,8 @@ export class ExtensionRpc {
       let completed = false
       const timeoutMs = command.method === "debugger.sendCommand"
         ? this.timeouts.debuggerCommandTimeoutMs ?? 60_000
+        : command.method === "tabs.requestAttach" && Predicate.isNumber(command.params?.timeoutMs)
+        ? command.params.timeoutMs + 2_000
         : this.timeouts.commandTimeoutMs ?? 15_000
       const finish = (effect: Effect.Effect<JsonObject, Error>) => {
         if (completed) {
@@ -157,7 +157,7 @@ export class ExtensionRpc {
         this.probeLiveness(socket)
         finish(Effect.fail(new Error(`Extension command timed out after ${timeoutMs}ms: ${command.method}`)))
       }, timeoutMs)
-      const debuggerTabId = command.method === "debugger.sendCommand" && typeof command.params?.tabId === "number"
+      const debuggerTabId = command.method === "debugger.sendCommand" && Predicate.isNumber(command.params?.tabId)
         ? command.params.tabId
         : undefined
       this.pendingRequests.set(id, {

@@ -4,13 +4,14 @@ import { once } from "node:events"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { performance } from "node:perf_hooks"
+import { Option, Predicate, Schema } from "effect"
 import { terminateChildProcess } from "./child-process.ts"
 import { mjpegMatroskaFrame, mjpegMatroskaHeader } from "./mjpeg-matroska.ts"
 import type { ExtensionCommand, JsonObject } from "./protocol.ts"
-import { getObject } from "./relay-helpers.ts"
+import { getNumber, getObject, getString } from "./relay-helpers.ts"
 import type { ConnectedTarget } from "./relay-types.ts"
 import { decodeRecordingFrame } from "./recording-protocol.ts"
-import type { RecordingQuality } from "./relay-schema.ts"
+import type { RecordingCancelResponse, RecordingQuality, RecordingStatusResponse, RecordingTargetRequest } from "./relay-schema.ts"
 
 const defaultMaxDurationMs = 15 * 60 * 1_000
 const defaultCdpFrameRate = 60
@@ -18,7 +19,7 @@ const maxRecordingFrameRate = 60
 const maxPendingCdpFrames = 30
 const fallbackCdpWidth = 1_280
 const fallbackCdpHeight = 720
-const cdpJpegQuality = 100
+const cdpJpegQuality = 85
 const maxPendingTabCaptureBytes = 16 * 1024 * 1024
 const maxTabCaptureOutputBytes = 1024 * 1024 * 1024
 
@@ -46,10 +47,7 @@ export type RecordingStartOptions = {
   readonly maxDurationMs?: number
 }
 
-export type RecordingTargetOptions = {
-  readonly tabId?: number
-  readonly sessionId?: string
-}
+export type RecordingTargetOptions = RecordingTargetRequest
 
 export type RecordingStartResult =
   | {
@@ -84,22 +82,9 @@ export type RecordingStopResult =
     readonly error: string
   }
 
-export type RecordingStatusResult = {
-  readonly isRecording: boolean
-  readonly tabId?: number
-  readonly startedAt?: number
-  readonly path?: string
-  readonly size?: number
-  readonly mode?: ActiveRecordingMode
-  readonly artifactType?: RecordingArtifactType
-  readonly frameCount?: number
-  readonly quality?: RecordingQuality
-}
+export type RecordingStatusResult = RecordingStatusResponse
 
-export type RecordingCancelResult = {
-  readonly success: boolean
-  readonly error?: string
-}
+export type RecordingCancelResult = RecordingCancelResponse
 
 type ActiveRecordingBase = {
   tabId: number
@@ -148,6 +133,8 @@ type CdpRecording = ActiveRecordingBase & {
   stopped: boolean
   stopping: boolean
   startedMonotonicAt: number
+  lastRawFramePosition?: number
+  lastMetadataTimestamp?: number
   stopPromise?: Promise<RecordingStopResult>
   writePromise: Promise<void>
   writeError?: Error
@@ -442,21 +429,17 @@ export class RecordingRelay {
       await this.cancelCdpRecording(recording)
       return
     }
-    await this.cleanupRecording(recording.tabId)
+    await this.cleanupTabCaptureRecording(recording)
   }
 
   handleRecordingCancelled(message: JsonObject): void {
     const params = getObject(message.params)
-    const tabId = typeof params?.tabId === "number" ? params.tabId : undefined
-    if (tabId === undefined) {
+    const tabId = getNumber(params, "tabId")
+    const recording = tabId === undefined ? undefined : this.activeRecordings.get(tabId)
+    if (!recording) {
       return
     }
-    const recording = this.activeRecordings.get(tabId)
-    if (recording?.mode === "tab-capture" && recording.finalizePromise) return
-    if (recording?.resolveStop) {
-      recording.resolveStop({ success: false, error: "Recording was cancelled" })
-    }
-    void this.cleanupRecording(tabId)
+    void this.abortActiveRecording(recording, "Recording was cancelled")
   }
 
   handleDebuggerEvent(options: { readonly tabId: number; readonly method: string; readonly params: JsonObject | undefined }): boolean {
@@ -467,8 +450,8 @@ export class RecordingRelay {
     if (!recording || recording.mode !== "cdp") {
       return false
     }
-    const frameSessionId = options.params?.sessionId
-    if (typeof frameSessionId === "number") {
+    const frameSessionId = getNumber(options.params, "sessionId")
+    if (frameSessionId !== undefined && options.params?.acked !== true) {
       void this.options.sendDebuggerCommand({
         tabId: recording.tabId,
         method: "Page.screencastFrameAck",
@@ -477,24 +460,47 @@ export class RecordingRelay {
         if (!recording.stopped && !recording.stopping) console.error("CDP recording frame acknowledgement failed", error)
       })
     }
-    if (recording.stopped || recording.stopping || typeof options.params?.data !== "string") {
+    const frameData = getString(options.params, "data")
+    if (recording.stopped || recording.stopping || frameData === undefined) {
       return true
     }
-    const metadata = getObject(options.params.metadata)
+    const metadata = getObject(options.params?.metadata)
     recording.sourceFrameCount += 1
     if (recording.pendingFrameCount >= maxPendingCdpFrames || recording.writeError) {
       recording.droppedFrameCount += 1
       return true
     }
-    if (typeof metadata?.deviceWidth === "number") recording.sourceWidth = metadata.deviceWidth
-    if (typeof metadata?.deviceHeight === "number") recording.sourceHeight = metadata.deviceHeight
-    const buffer = Buffer.from(options.params.data, "base64")
+    const deviceWidth = getNumber(metadata, "deviceWidth")
+    const deviceHeight = getNumber(metadata, "deviceHeight")
+    const metadataTimestamp = getNumber(metadata, "timestamp")
+    if (deviceWidth !== undefined) recording.sourceWidth = deviceWidth
+    if (deviceHeight !== undefined) recording.sourceHeight = deviceHeight
+    const buffer = Buffer.from(frameData, "base64")
     const receivedAt = this.monotonicNow()
-    const frameNumber = recording.sourceFrameCount === 1
-      ? 0
-      : Math.max(0, Math.floor(((receivedAt - recording.startedMonotonicAt) / 1_000) * recording.frameRate))
+    const isFirstFrame = recording.sourceFrameCount === 1
+    const rawFramePosition = ((receivedAt - recording.startedMonotonicAt) / 1_000) * recording.frameRate
     recording.pendingFrameCount += 1
     recording.writePromise = recording.writePromise.then(async () => {
+      const floorFrame = isFirstFrame ? 0 : Math.max(0, Math.floor(rawFramePosition))
+      const deltaWall = recording.lastRawFramePosition === undefined ? 1 : rawFramePosition - recording.lastRawFramePosition
+      const deltaMeta =
+        metadataTimestamp !== undefined && recording.lastMetadataTimestamp !== undefined
+          ? Math.min(2, Math.max(0, (metadataTimestamp - recording.lastMetadataTimestamp) * recording.frameRate))
+          : 0
+      const deltaRaw = Math.max(deltaWall, deltaMeta)
+      recording.lastRawFramePosition = rawFramePosition
+      if (metadataTimestamp !== undefined) recording.lastMetadataTimestamp = metadataTimestamp
+      let frameNumber = recording.lastFrame
+        ? Math.max(recording.lastFrame.frameNumber, floorFrame)
+        : floorFrame
+      if (
+        recording.lastFrame &&
+        frameNumber === recording.lastFrame.frameNumber &&
+        (rawFramePosition - recording.lastFrame.frameNumber >= 0.5 ||
+          (deltaRaw >= 0.30 && recording.lastFrame.frameNumber - rawFramePosition < 3.0))
+      ) {
+        frameNumber = recording.lastFrame.frameNumber + 1
+      }
       if (recording.lastFrame && frameNumber !== recording.lastFrame.frameNumber) {
         await this.writeSourceFrame(recording, recording.lastFrame, frameNumber)
       } else if (recording.lastFrame) {
@@ -503,7 +509,7 @@ export class RecordingRelay {
       recording.lastFrame = {
         buffer,
         frameNumber,
-        ...(typeof metadata?.deviceWidth === "number" ? { surfaceWidth: metadata.deviceWidth } : {}),
+        ...(deviceWidth !== undefined ? { surfaceWidth: deviceWidth } : {}),
       }
     }).catch((error: unknown) => {
       recording.writeError = error instanceof Error ? error : new Error(String(error))
@@ -584,37 +590,16 @@ export class RecordingRelay {
   }
 
   private findRecording(options: RecordingTargetOptions): ActiveRecording | undefined {
-    if (options.tabId !== undefined) {
-      return this.activeRecordings.get(options.tabId)
-    }
-    if (options.sessionId) {
-      return Array.from(this.activeRecordings.values()).find((recording) => {
-        return recording.sessionId === options.sessionId
-      })
-    }
-    const recordings = Array.from(this.activeRecordings.values())
-    if (recordings.length > 1) {
-      throw new Error("Multiple active recordings; provide sessionId or tabId")
-    }
-    return recordings[0]
+    return findByRecordingTarget(this.activeRecordings, options, "Multiple active recordings; provide sessionId or tabId")
   }
 
   private findStartingRecording(options: RecordingTargetOptions): StartingRecording | undefined {
-    if (options.tabId !== undefined) return this.startingRecordings.get(options.tabId)
-    if (options.sessionId) {
-      return Array.from(this.startingRecordings.values()).find((recording) => recording.sessionId === options.sessionId)
-    }
-    const recordings = Array.from(this.startingRecordings.values())
-    if (recordings.length > 1) throw new Error("Multiple recordings are starting; provide sessionId or tabId")
-    return recordings[0]
+    return findByRecordingTarget(this.startingRecordings, options, "Multiple recordings are starting; provide sessionId or tabId")
   }
 
   private async cleanupRecording(tabId: number): Promise<void> {
     const recording = this.activeRecordings.get(tabId)
     if (!recording) return
-    if (recording?.maxDurationTimer) {
-      clearTimeout(recording.maxDurationTimer)
-    }
     if (recording.mode === "cdp") {
       await this.cancelCdpRecording(recording)
       return
@@ -729,17 +714,7 @@ export class RecordingRelay {
     const frameRate = options.frameRate ?? defaultCdpFrameRate
     let size: { readonly width: number; readonly height: number }
     try {
-      await this.options.sendDebuggerCommand({
-        tabId: options.tabId,
-        method: "Page.bringToFront",
-        params: {},
-      })
-      const metrics = await this.options.sendDebuggerCommand({
-        tabId: options.tabId,
-        method: "Page.getLayoutMetrics",
-        params: {},
-      })
-      size = cdpRecordingSize(metrics)
+      size = await prepareCdpScreencastViewport(this.options.sendDebuggerCommand, options.tabId)
     } catch (error) {
       return { success: false, error: `Could not prepare the page for recording: ${error instanceof Error ? error.message : String(error)}` }
     }
@@ -869,8 +844,9 @@ export class RecordingRelay {
           method: "Page.captureScreenshot",
           params: { format: "jpeg", quality: cdpJpegQuality, fromSurface: true, captureBeyondViewport: false },
         })
-        if (typeof screenshot.data !== "string") throw new Error("No video frames were captured")
-        recording.lastFrame = { buffer: Buffer.from(screenshot.data, "base64"), frameNumber: 0 }
+        const screenshotData = getString(screenshot, "data")
+        if (screenshotData === undefined) throw new Error("No video frames were captured")
+        recording.lastFrame = { buffer: Buffer.from(screenshotData, "base64"), frameNumber: 0 }
       }
       const durationMs = Math.max(0, stoppedMonotonicAt - recording.startedMonotonicAt)
       const expectedFrameCount = Math.max(1, Math.round((durationMs / 1_000) * recording.frameRate))
@@ -956,47 +932,74 @@ function recordingStartParams(options: RecordingStartOptions): JsonObject {
   }
 }
 
+const ExtensionStartResultSchema = Schema.Union([
+  Schema.Struct({
+    success: Schema.Literal(true),
+    tabId: Schema.Number,
+    startedAt: Schema.Number,
+    mimeType: Schema.optionalKey(Schema.String),
+  }),
+  Schema.Struct({
+    success: Schema.Literal(false),
+    error: Schema.String,
+  }),
+])
+const decodeExtensionStartResult = Schema.decodeUnknownOption(ExtensionStartResultSchema)
+
+const ExtensionStopResultSchema = Schema.Union([
+  Schema.Struct({
+    success: Schema.Literal(true),
+    tabId: Schema.Number,
+    duration: Schema.Number,
+  }),
+  Schema.Struct({
+    success: Schema.Literal(false),
+    error: Schema.String,
+  }),
+])
+const decodeExtensionStopResult = Schema.decodeUnknownOption(ExtensionStopResultSchema)
+
 function parseExtensionStartResult(value: JsonObject): ExtensionStartResult {
-  if (value.success === true && typeof value.tabId === "number" && typeof value.startedAt === "number") {
-    return {
-      success: true,
-      tabId: value.tabId,
-      startedAt: value.startedAt,
-      ...(typeof value.mimeType === "string" ? { mimeType: value.mimeType } : {}),
-    }
-  }
-  if (value.success === false && typeof value.error === "string") {
-    return { success: false, error: value.error }
-  }
-  return { success: false, error: "Invalid recording.start response from extension" }
+  return Option.getOrElse(decodeExtensionStartResult(value), () => ({
+    success: false,
+    error: "Invalid recording.start response from extension",
+  }))
 }
 
 function parseExtensionStopResult(value: JsonObject): ExtensionStopResult {
-  if (value.success === true && typeof value.tabId === "number" && typeof value.duration === "number") {
-    return { success: true, tabId: value.tabId, duration: value.duration }
-  }
-  if (value.success === false && typeof value.error === "string") {
-    return { success: false, error: value.error }
-  }
-  return { success: false, error: "Invalid recording.stop response from extension" }
+  return Option.getOrElse(decodeExtensionStopResult(value), () => ({
+    success: false,
+    error: "Invalid recording.stop response from extension",
+  }))
 }
 
 function parseExtensionStatusResult(value: JsonObject): ExtensionStatusResult {
   return {
     isRecording: value.isRecording === true,
-    ...(typeof value.tabId === "number" ? { tabId: value.tabId } : {}),
-    ...(typeof value.startedAt === "number" ? { startedAt: value.startedAt } : {}),
+    ...(Predicate.isNumber(value.tabId) ? { tabId: value.tabId } : {}),
+    ...(Predicate.isNumber(value.startedAt) ? { startedAt: value.startedAt } : {}),
   }
 }
 
 function parseCancelResult(value: JsonObject): RecordingCancelResult {
   return {
     success: value.success === true,
-    ...(typeof value.error === "string" ? { error: value.error } : {}),
+    ...(Predicate.isString(value.error) ? { error: value.error } : {}),
   }
 }
 
-function cdpArtifactType(outputPath: string): "webm" | "mp4" | undefined {
+export function findByRecordingTarget<T extends { readonly sessionId?: string }>(
+  map: ReadonlyMap<number, T>,
+  target: RecordingTargetOptions,
+  ambiguousMessage: string,
+): T | undefined {
+  if (target.tabId !== undefined) return map.get(target.tabId)
+  if (target.sessionId) return [...map.values()].find((entry) => entry.sessionId === target.sessionId)
+  if (map.size > 1) throw new Error(ambiguousMessage)
+  return map.values().next().value
+}
+
+export function cdpArtifactType(outputPath: string): "webm" | "mp4" | undefined {
   const extension = path.extname(outputPath).toLowerCase()
   if (extension === ".webm") return "webm"
   if (extension === ".mp4") return "mp4"
@@ -1021,21 +1024,43 @@ function recordingQuality(recording: CdpRecording, durationMs: number): Recordin
   }
 }
 
-export function cdpRecordingSize(metrics: JsonObject): { readonly width: number; readonly height: number } {
+export async function prepareCdpScreencastViewport(
+  sendDebuggerCommand: SendDebuggerCommand,
+  tabId: number,
+): Promise<{ readonly width: number; readonly height: number }> {
+  await sendDebuggerCommand({ tabId, method: "Page.bringToFront", params: {} })
+  const metrics = await sendDebuggerCommand({ tabId, method: "Page.getLayoutMetrics", params: {} })
+  return cdpRecordingSize(metrics)
+}
+
+function cdpRecordingSize(metrics: JsonObject): { readonly width: number; readonly height: number } {
   const viewport = getObject(metrics.cssVisualViewport) ?? getObject(metrics.visualViewport)
-  const viewportWidth = typeof viewport?.clientWidth === "number" ? viewport.clientWidth : fallbackCdpWidth
-  const viewportHeight = typeof viewport?.clientHeight === "number" ? viewport.clientHeight : fallbackCdpHeight
+  const viewportWidth = Predicate.isNumber(viewport?.clientWidth) ? viewport.clientWidth : fallbackCdpWidth
+  const viewportHeight = Predicate.isNumber(viewport?.clientHeight) ? viewport.clientHeight : fallbackCdpHeight
   return {
     width: Math.max(2, Math.floor(viewportWidth) & ~1),
     height: Math.max(2, Math.floor(viewportHeight) & ~1),
   }
 }
 
+let ffmpegCheckPromise: Promise<void> | undefined
+
+function ensureFfmpegAvailable(): Promise<void> {
+  return ffmpegCheckPromise ??= new Promise<void>((resolve, reject) => {
+    execFile("ffmpeg", ["-version"], { timeout: 5_000 }, (error) => {
+      if (error) {
+        ffmpegCheckPromise = undefined
+        reject(error)
+      } else {
+        resolve()
+      }
+    })
+  })
+}
+
 export async function startFfmpegVideoEncoder(options: Parameters<StartVideoEncoder>[0]): Promise<VideoEncoder> {
   // Preserve start-time dependency errors even though geometry arrives later.
-  await new Promise<void>((resolve, reject) => {
-    execFile("ffmpeg", ["-version"], { timeout: 5_000 }, (error) => error ? reject(error) : resolve())
-  })
+  await ensureFfmpegAvailable()
   // The first compositor frame supplies the backing surface's CSS width. It can
   // differ from both the emulated viewport and the JPEG's Retina pixel width.
   let acquisition: Promise<VideoEncoder> | undefined
@@ -1069,8 +1094,8 @@ async function createFfmpegVideoEncoder(options: {
 }): Promise<VideoEncoder> {
   const temporaryOutputPath = `${options.outputPath}.partial-${process.pid}-${crypto.randomUUID()}`
   const outputArgs = options.artifactType === "webm"
-    ? ["-c:v", "libvpx", "-crf", "8", "-deadline", "realtime", "-cpu-used", "8", "-b:v", "2M", "-threads", "1"]
-    : ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    ? ["-c:v", "libvpx", "-crf", "4", "-deadline", "good", "-cpu-used", "4", "-b:v", "6M", "-threads", "2"]
+    : ["-c:v", "libx264", "-preset", "veryfast", "-crf", "15", "-tune", "animation", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
   const child = spawn("ffmpeg", [
     "-hide_banner",
     "-loglevel",
@@ -1092,7 +1117,7 @@ async function createFfmpegVideoEncoder(options: {
     "-fps_mode",
     "cfr",
     "-vf",
-    `scale=min(iw\\,${options.surfaceWidth}):-1:flags=lanczos,pad=ceil(max(iw\\,${options.width})/2)*2:ceil(max(ih\\,${options.height})/2)*2:0:0:gray,crop=${options.width}:${options.height}:0:0`,
+    `scale=min(iw\\,${options.surfaceWidth}):-1:flags=fast_bilinear,pad=ceil(max(iw\\,${options.width})/2)*2:ceil(max(ih\\,${options.height})/2)*2:0:0:gray,crop=${options.width}:${options.height}:0:0`,
     ...outputArgs,
     "-f",
     options.artifactType,
@@ -1130,9 +1155,7 @@ async function createFfmpegVideoEncoder(options: {
       if (completed || finishingPromise || cancelPromise) throw new Error("ffmpeg input closed before recording finished")
       const envelope = mjpegMatroskaFrame(timestampMs, durationMs, frame.length)
       try {
-        await writeStreamChunk(child.stdin, envelope.header)
-        await writeStreamChunk(child.stdin, frame)
-        await writeStreamChunk(child.stdin, envelope.trailer)
+        await writeStreamChunk(child.stdin, Buffer.concat([envelope.header, frame, envelope.trailer]))
       } catch (error) {
         throw new Error(`${error instanceof Error ? error.message : String(error)}${stderr.trim() ? `: ${stderr.trim()}` : ""}`)
       }

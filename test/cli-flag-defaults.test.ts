@@ -6,6 +6,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
+import { build } from "esbuild"
 import type * as RelaySchema from "../src/relay-schema.ts"
 import { browserControlBuildId, browserControlVersion } from "../src/version.ts"
 
@@ -30,6 +31,8 @@ const routes = new Map<string, unknown>([
 const requests: Array<{ route: string; body: unknown }> = []
 const pendingCommands = new Set<ReturnType<typeof execFileAsync>>()
 let home: string
+let cliDirectory: string
+let cliPath: string
 let port: number
 const server = http.createServer((request, response) => {
   const route = `${request.method} ${request.url}`
@@ -45,6 +48,18 @@ const server = http.createServer((request, response) => {
 
 beforeAll(async () => {
   home = await mkdtemp(path.join(os.tmpdir(), "browser-control-cli-"))
+  // Exercise the CLI/HTTP boundary without retranspiling the whole source graph
+  // in every child process. Keep its parent at the package root for assets.
+  cliDirectory = await mkdtemp(path.join(packageRoot, ".cli-test-"))
+  cliPath = path.join(cliDirectory, "cli.js")
+  await build({
+    entryPoints: [path.join(packageRoot, "src/cli.ts")], outfile: cliPath,
+    bundle: true, platform: "node", format: "esm", packages: "external",
+    define: {
+      "globalThis.__BROWSER_CONTROL_VERSION__": JSON.stringify(browserControlVersion),
+      "globalThis.__BROWSER_CONTROL_BUILD_ID__": JSON.stringify(browserControlBuildId),
+    },
+  })
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject)
     server.listen(0, "127.0.0.1", resolve)
@@ -69,23 +84,54 @@ afterAll(async () => {
   await Promise.all([
     new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
     rm(home, { recursive: true, force: true }),
+    rm(cliDirectory, { recursive: true, force: true }),
   ])
 })
 
-function runCli(args: string[]) {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("BROWSER_CONTROL_")))
-  const command = execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
+function runCli(args: string[], overrides: NodeJS.ProcessEnv = {}) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("BROWSER_CONTROL_") && name !== "OPENCODE_SESSION_ID"))
+  const command = execFileAsync(process.execPath, [cliPath, ...args], {
     cwd: packageRoot,
-    env: { ...env, HOME: home, BROWSER_CONTROL_PORT: String(port), NO_COLOR: "1" },
-    timeout: 10_000,
+    env: { ...env, HOME: home, BROWSER_CONTROL_PORT: String(port), NO_COLOR: "1", ...overrides },
+    timeout: 30_000,
   })
   pendingCommands.add(command)
   void command.finally(() => pendingCommands.delete(command)).catch(() => {})
   return command
 }
 
-describe("CLI opt-in boolean flags", { timeout: 15_000 }, () => {
-  // These verify CLI/HTTP contracts, not latency. Let the existing 10s child
+describe("CLI opt-in boolean flags", { timeout: 70_000 }, () => {
+  it("reuses the agent identity for successive unnamed executes", async () => {
+    for (let i = 0; i < 2; i++) await runCli(["execute", "return 1"], { OPENCODE_SESSION_ID: "ses_e9d744b52ffe5iJFeCm3sIeaoA" })
+    expect(requests.map((request) => request.body)).toEqual([
+      { sessionId: "oc-ses_e9d744b52ffe5ijfecm3sieaoa", code: "return 1", createIfMissing: true },
+      { sessionId: "oc-ses_e9d744b52ffe5ijfecm3sieaoa", code: "return 1", createIfMissing: true },
+    ])
+  })
+
+  it("explicit sessions take precedence over the agent identity", async () => {
+    await runCli(["execute", "--session", "chosen", "return 1"], { OPENCODE_SESSION_ID: "ses_agent" })
+    expect(requests[0]?.body).toEqual({ sessionId: "chosen", code: "return 1", createIfMissing: false })
+  })
+
+  it("an explicit agent default session recreates itself after idle reaping", async () => {
+    await runCli(["execute", "--session", "oc-ses_agent", "return 1"], { OPENCODE_SESSION_ID: "ses_Agent" })
+    expect(requests[0]?.body).toEqual({ sessionId: "oc-ses_agent", code: "return 1", createIfMissing: true })
+  })
+
+  it("--rm asks the relay to clean a fresh session and prints no continuation", async () => {
+    const { stderr } = await runCli(["execute", "--rm", "return 1"], { OPENCODE_SESSION_ID: "ses_agent" })
+    expect(stderr).toBe("")
+    expect(requests[0]?.body).toEqual({ code: "return 1", createIfMissing: true, removeAfterExecute: true })
+  })
+
+  it("--rm rejects an explicit persistent session", async () => {
+    await expect(runCli(["execute", "--rm", "--session", "keep", "return 1"])).rejects.toMatchObject({
+      code: 1, stderr: expect.stringContaining("Use --rm without --session"),
+    })
+    expect(requests).toEqual([])
+  })
+  // These verify CLI/HTTP contracts, not latency. Let the 30s child
   // deadline report first, with time left for teardown before the next test.
   it.each([false, true])("execute accepts --json supplied=%s", async (json) => {
     const { stdout, stderr } = await runCli(["execute", ...(json ? ["--json"] : []), "return 1"])
@@ -107,6 +153,16 @@ describe("CLI opt-in boolean flags", { timeout: 15_000 }, () => {
     expect(requests).toEqual([{
       route: "POST /cli/session/adopt",
       body: { ...(explicit ? { sessionId: session.id } : {}), createIfMissing: true, targetSelection: { urlIncludes: "example.test" } },
+    }])
+  })
+
+  it("session adopt allows omitting target selectors when adopting a single attached tab", async () => {
+    const { stdout } = await runCli(["session", "adopt", "--session", session.id])
+
+    expect(stdout).toBe(`Created and adopted session '${session.id}' default page: https://example.test/\n`)
+    expect(requests).toEqual([{
+      route: "POST /cli/session/adopt",
+      body: { sessionId: session.id, createIfMissing: true },
     }])
   })
 

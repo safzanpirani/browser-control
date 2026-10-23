@@ -68,7 +68,7 @@ async function openSocket(url: string): Promise<WebSocket> {
  * rewrite the rejection into "Execution context was destroyed".
  */
 describe("relay protected frames", () => {
-  it("retracts a protected child frame, suppresses its events, and tracks the debugger block", async () => {
+  it.each(["removed", "restored", "partially-restored"])("retracts a protected child frame and clears the debugger block when %s", async (dismissal) => {
     const port = await freePort()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const relay = yield* startRelay({ port, sessionCatalogPath: null })
@@ -116,9 +116,10 @@ describe("relay protected frames", () => {
           emit("Runtime.consoleAPICalled", { type: "log", args: [], executionContextId: 1, timestamp })
           await delivered
         }
-        const pageEvents = () => events
-          .filter((event) => event.method.startsWith("Page."))
-          .map((event) => [event.method, event.params?.frameId ?? (event.params?.frame as JsonObject | undefined)?.id, event.params?.reason ?? event.params?.url ?? event.params?.name])
+        const pageEvents = () => events.flatMap((event) =>
+          event.method.startsWith("Page.")
+            ? [[event.method, event.params?.frameId ?? (event.params?.frame as JsonObject | undefined)?.id, event.params?.reason ?? event.params?.url ?? event.params?.name]]
+            : [])
         try {
           expect((await send(owner, { method: "Target.createTarget", params: { url: "about:blank" } })).result).toEqual({ targetId: "root-target" })
           const rootSession = events.find((event) => event.method === "Target.attachedToTarget")?.params?.sessionId
@@ -145,25 +146,42 @@ describe("relay protected frames", () => {
             ["Page.lifecycleEvent", "menu-frame", "init"],
             ["Page.frameDetached", "menu-frame", "remove"],
           ])
-          expect(events.filter((event) => event.method === "Page.frameDetached").map((event) => event.sessionId)).toEqual([rootSession])
+          expect(events.flatMap((event) => event.method === "Page.frameDetached" ? [event.sessionId] : [])).toEqual([rootSession])
 
           // Chrome now refuses every debugger command for the tab; the relay records the block on the root target.
           rejectDebuggerCommands = true
           const rejected = await send(owner, { method: "Runtime.evaluate", params: { expression: "1" }, sessionId: rootSession })
           expect(rejected.error?.message).toBe(crossExtensionError)
           expect(await protectedUi(relay.url)).toBe(true)
+          if (dismissal === "partially-restored") {
+            emit("Page.frameNavigated", { frame: { id: "other-menu", parentId: "root-target", url: protectedFrameUrl } })
+            await flush()
+          }
 
           // Events for the protected frame stay hidden, including its real removal.
           events.length = 0
           emit("Page.lifecycleEvent", { frameId: "menu-frame", loaderId: "menu-loader", name: "load", timestamp: 3 })
           emit("Page.frameStoppedLoading", { frameId: "menu-frame" })
-          emit("Page.frameDetached", { frameId: "menu-frame", reason: "remove" })
+          if (dismissal === "removed") {
+            emit("Page.frameDetached", { frameId: "menu-frame", reason: "remove" })
+          } else {
+            emit("Page.frameNavigated", { frame: { id: "menu-frame", parentId: "root-target", url: "about:blank", loaderId: "ordinary-loader", securityOrigin: "", mimeType: "text/html" } })
+          }
           emit("Page.lifecycleEvent", { frameId: "payment-frame", loaderId: "pay-loader", name: "networkIdle", timestamp: 4 })
           await flush()
           expect(pageEvents()).toEqual([
+            ...(dismissal !== "removed" ? [
+              ["Page.frameAttached", "menu-frame", undefined],
+              ["Page.frameNavigated", "menu-frame", undefined],
+            ] : []),
             ["Page.lifecycleEvent", "payment-frame", "networkIdle"],
           ])
           // Dismissing the menu lifts the block before any command is retried.
+          if (dismissal === "partially-restored") {
+            expect(await protectedUi(relay.url)).toBe(true)
+            emit("Page.frameDetached", { frameId: "other-menu", reason: "remove" })
+            await flush()
+          }
           expect(await protectedUi(relay.url)).toBeUndefined()
 
           rejectDebuggerCommands = false
@@ -230,7 +248,7 @@ describe("relay protected frames", () => {
           emit("Page.lifecycleEvent", { frameId: "menu-frame", loaderId: "menu-loader", name: "load", timestamp: 1 })
           emit("Runtime.consoleAPICalled", { type: "log", args: [], executionContextId: 1, timestamp: 2 })
           await delivered
-          expect(events.filter((event) => event.method === "Page.lifecycleEvent").map((event) => event.params?.frameId)).toEqual(["menu-frame"])
+          expect(events.flatMap((event) => event.method === "Page.lifecycleEvent" ? [event.params?.frameId] : [])).toEqual(["menu-frame"])
         } finally {
           client.close()
           extension.close()

@@ -1,6 +1,6 @@
 {
   "name": "@opencode-ai/browser-control",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "description": "Local browser driver for trusted agents: control your existing Chromium-family browser through a small extension and a local relay.",
   "license": "MIT",
   "packageManager": "pnpm@11.20.0",
@@ -16,6 +16,10 @@
     ".": {
       "types": "./dist/types/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/types/opencode.d.ts",
+      "import": "./dist/opencode.js"
     }
   },
   "files": [
@@ -55,18 +59,17 @@
     "gauntlet": "tsx scripts/gauntlet.ts",
     "gauntlet:isolated": "tsx scripts/gauntlet-isolated.ts",
     "smoke:snapshot": "tsx scripts/check-snapshot.ts",
-    "repro:snapshot-image-name": "tsx scripts/check-snapshot-image-name.ts",
     "repro:screenshot-zoom": "tsx scripts/check-screenshot-zoom.ts",
+    "repro:page-preservation": "tsx scripts/check-page-preservation.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "smoke:snapshot-image": "tsx scripts/check-snapshot-image-name.ts",
     "smoke:debugger-ownership": "pnpm build:extension && tsx scripts/check-debugger-ownership.ts"
   },
   "dependencies": {
-    "@effect/platform-node": "4.0.0-rc.118",
-    "@effect/platform-node-shared": "4.0.0-rc.118",
+    "@effect/platform-node": "4.0.1",
+    "@effect/platform-node-shared": "4.0.1",
     "acorn": "^8.18.0",
-    "effect": "4.0.0-rc.118",
+    "effect": "4.0.1",
     "pixelmatch": "^7.2.0",
     "playwright-core": "^1.63.0",
     "pngjs": "^7.0.0",
@@ -74,16 +77,16 @@
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.3",
-    "@types/chrome": "^0.3.0",
-    "@types/node": "^26.6.3",
+    "@types/chrome": "^0.3.4",
+    "@types/node": "^26.6.4",
     "@types/pngjs": "^6.0.5",
-    "@types/ws": "^8.18.1",
+    "@types/ws": "^8.18.2",
     "esbuild": "^0.28.2",
     "fflate": "^0.8.3",
-    "jscpd": "^5.3.2",
-    "knip": "^6.38.0",
+    "jscpd": "^5.4.0",
+    "knip": "^6.39.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.3"
   }
 }

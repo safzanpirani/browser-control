@@ -37,12 +37,20 @@ export type WebMcpHelper = {
 type CollectedTool = Omit<WebMcpTool, "frame" | "frameUrl">
 
 export function createWebMcpHelper(page: Page): WebMcpHelper {
-  const collect = () => collectWebMcpTools(page)
   return {
-    list: collect,
+    list: async () => {
+      const listing = await collectWebMcpToolsWithFrames(page, defaultFrameTimeoutMs)
+      return {
+        available: listing.available,
+        tools: listing.tools.map(({ tool }) => tool),
+        omitted: listing.omitted,
+      }
+    },
     call: async (name, input = {}, options = {}) => {
       if (!name.trim()) throw new Error("webmcp.call requires a non-empty tool name")
-      const listing = await collectWebMcpToolsWithFrames(page, options.timeout ?? defaultFrameTimeoutMs)
+      const timeoutMs = options.timeout ?? defaultFrameTimeoutMs
+      const deadline = Date.now() + timeoutMs
+      const listing = await collectWebMcpToolsWithFrames(page, timeoutMs)
       const matches = listing.tools.filter((candidate) => {
         return candidate.tool.name === name &&
           (options.frame === undefined || candidate.tool.frame === options.frame || candidate.tool.frameUrl === options.frame)
@@ -57,19 +65,10 @@ export function createWebMcpHelper(page: Page): WebMcpHelper {
       const match = matches[0]!
       return await withTimeout(
         match.frame.evaluate(callWebMcpToolInPage, { name, inputJson: JSON.stringify(input) }),
-        options.timeout ?? defaultFrameTimeoutMs,
+        Math.max(1, deadline - Date.now()),
         `WebMCP tool ${JSON.stringify(name)} timed out`,
       )
     },
-  }
-}
-
-async function collectWebMcpTools(page: Page, timeoutMs = defaultFrameTimeoutMs): Promise<WebMcpListing> {
-  const listing = await collectWebMcpToolsWithFrames(page, timeoutMs)
-  return {
-    available: listing.available,
-    tools: listing.tools.map(({ tool }) => tool),
-    omitted: listing.omitted,
   }
 }
 
@@ -84,7 +83,7 @@ async function collectWebMcpToolsWithFrames(page: Page, timeoutMs: number): Prom
   const results = await Promise.all(frames.map(async (frame, index) => {
     const frameUrl = frame.url()
     const frameLabel = (urlCounts.get(frameUrl) ?? 0) > 1 ? `${frameUrl} (frame ${index})` : frameUrl
-    const result = await withTimeout(frame.evaluate(collectWebMcpToolsInPage).catch(() => null), timeoutMs, "WebMCP discovery timed out")
+    const result = await withTimeout(frame.evaluate(collectWebMcpToolsInPage), timeoutMs, "WebMCP discovery timed out")
       .catch(() => null)
     return { frame, frameUrl, frameLabel, result }
   }))

@@ -1,36 +1,157 @@
 import type { PageStatus } from "../../src/protocol.ts"
+import { DynamicIslandRig, ISLAND_CANVAS_H, ISLAND_CANVAS_W, springCss } from "./dynamic-island-gpu.ts"
 import { pageStatusFromJson, pageStatusView } from "./page-status.ts"
 
 const hostId = "__browser_control_page_status__"
 let currentStatus: PageStatus | undefined
+let pendingTabRequest: { readonly requestId: string; readonly sessionId?: string; readonly message: string } | undefined
 let observer: MutationObserver | undefined
 let completingHandoffId: string | undefined
 let attendedCursor: HTMLElement | undefined
 let cursorAnimation: Animation | undefined
 let cursorFill: string | null | undefined
 let cursorFilter: string | undefined
+let islandRig: DynamicIslandRig | undefined
+let collapseCleanupTimer: ReturnType<typeof setTimeout> | undefined
 
-chrome.runtime.onMessage.addListener((message: unknown) => {
+chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
   if (!message || typeof message !== "object" || Array.isArray(message)) {
     return
   }
-  const incoming = message as { readonly action?: unknown; readonly status?: unknown }
+  const incoming = message as { readonly action?: unknown; readonly status?: unknown; readonly requestId?: unknown; readonly sessionId?: unknown; readonly message?: unknown }
+  if (incoming.action === "evict-extension-frames") {
+    const removed = evictForeignExtensionFrames()
+    sendResponse({ removed })
+    return
+  }
+  if (incoming.action === "tab-request.prompt" && typeof incoming.requestId === "string") {
+    pendingTabRequest = {
+      requestId: incoming.requestId,
+      ...(typeof incoming.sessionId === "string" && incoming.sessionId ? { sessionId: incoming.sessionId } : {}),
+      message: typeof incoming.message === "string" && incoming.message ? incoming.message : "Allow Browser Control to use this tab?",
+    }
+    currentStatus = {
+      state: "waiting",
+      owner: "user",
+      ...(pendingTabRequest.sessionId ? { sessionId: pendingTabRequest.sessionId } : {}),
+      message: pendingTabRequest.message,
+      handoffId: `tab-request:${pendingTabRequest.requestId}`,
+    }
+    renderStatus()
+    sendResponse({ shown: true })
+    return
+  }
   if (incoming.action === "page-status.clear") {
+    pendingTabRequest = undefined
     clearStatus()
     return
   }
   const status = pageStatusFromJson(incoming.status)
   if (incoming.action === "page-status.set" && status) {
+    pendingTabRequest = undefined
     currentStatus = status
     completingHandoffId = undefined
+    if (status.state !== "waiting") {
+      evictForeignExtensionFrames()
+    }
     renderStatus()
   }
 })
 
+const foreignExtensionSelector = [
+  "com-1password-notification",
+  "com-1password-menu",
+  "com-1password-button",
+  "[data-onepassword-extension]",
+  "[data-lastpass-root]",
+  "[id^='bitwarden-']",
+  "iframe[src^='chrome-extension://']",
+  "frame[src^='chrome-extension://']",
+  "object[data^='chrome-extension://']",
+  "embed[src^='chrome-extension://']",
+].join(",")
+
+function evictForeignExtensionNodesIn(
+  root: Document | ShadowRoot | Element,
+  pierceShadows = false,
+): number {
+  let removed = 0
+  const ownOrigin = `chrome-extension://${chrome.runtime.id}`
+  const isForeignFrameElement = (el: Element): boolean => {
+    if (el.id === hostId || el.id === "__browser_control_ghost_cursor__") return false
+    const rawSrc = el.getAttribute("src") ?? el.getAttribute("data") ?? (el as HTMLIFrameElement).src
+    const src = typeof rawSrc === "string" ? rawSrc : ""
+    if (src.startsWith(ownOrigin)) return false
+    if (src.startsWith("chrome-extension://")) return true
+    if (el.matches(foreignExtensionSelector)) return true
+    if (el instanceof HTMLIFrameElement || el.tagName === "FRAME") {
+      try {
+        const href = (el as HTMLIFrameElement).contentWindow?.location?.href ?? ""
+        if (href.startsWith("chrome-extension://") && !href.startsWith(ownOrigin)) return true
+      } catch {
+        // Cross-origin frame; child content-script ("all_frames": true) handles its own DOM
+      }
+    }
+    return false
+  }
+  if (root instanceof Element && isForeignFrameElement(root)) {
+    root.remove()
+    return 1
+  }
+  for (const el of root.querySelectorAll(`iframe, frame, ${foreignExtensionSelector}`)) {
+    if (isForeignFrameElement(el)) {
+      el.remove()
+      removed += 1
+    }
+  }
+  if (pierceShadows) {
+    if (root instanceof Element && root.id !== hostId && root.shadowRoot) {
+      removed += evictForeignExtensionNodesIn(root.shadowRoot, true)
+    }
+    for (const el of root.querySelectorAll("*")) {
+      if (el.id !== hostId && el.shadowRoot) {
+        removed += evictForeignExtensionNodesIn(el.shadowRoot, true)
+      }
+    }
+  }
+  return removed
+}
+
+function evictForeignExtensionFrames(): number {
+  return document.documentElement ? evictForeignExtensionNodesIn(document, true) : 0
+}
+
 chrome.runtime.sendMessage({ action: "page-status.ready" }).catch(() => {})
+window.addEventListener("keydown", (event) => {
+  if (pendingTabRequest && event.key === "Escape") {
+    event.preventDefault()
+    event.stopPropagation()
+    decideTabRequest(pendingTabRequest.requestId, false)
+    return
+  }
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && currentStatus?.state === "waiting" && currentStatus.handoffId) {
+    event.preventDefault()
+    event.stopPropagation()
+    if (pendingTabRequest) {
+      decideTabRequest(pendingTabRequest.requestId, true)
+    } else {
+      completeHandoff(currentStatus.handoffId)
+    }
+  }
+}, true)
+document.addEventListener("DOMContentLoaded", () => {
+  if (currentStatus) {
+    if (currentStatus.state !== "waiting") evictForeignExtensionFrames()
+    renderStatus()
+  }
+}, { once: true })
 
 function renderStatus(): void {
   if (!currentStatus || !document.documentElement) {
+    return
+  }
+  if (window !== window.top) {
+    observeHost()
     return
   }
   let host = document.getElementById(hostId)
@@ -43,193 +164,175 @@ function renderStatus(): void {
       :host {
         all: initial !important;
         position: fixed !important;
-        right: 10px !important;
-        bottom: 10px !important;
+        top: 0 !important;
+        left: 50% !important;
+        width: ${ISLAND_CANVAS_W}px !important;
+        height: ${ISLAND_CANVAS_H}px !important;
+        transform: translateX(-50%) !important;
         z-index: 2147483647 !important;
         pointer-events: none !important;
         user-select: none !important;
-        contain: layout style paint !important;
+        contain: layout style !important;
       }
       :host([data-interactive="true"]) {
         user-select: text !important;
       }
-      :host([data-waiting="true"]) {
-        inset: 0 !important;
-        width: auto !important;
-        height: auto !important;
-        z-index: 2147483645 !important;
-      }
-      #status {
-        box-sizing: border-box;
-        max-width: min(360px, calc(100vw - 20px));
-        overflow: hidden;
-        padding: 4px 7px;
-        border: 1px solid rgba(255, 255, 255, 0.14);
-        border-radius: 999px;
-        background: rgba(24, 24, 27, 0.76);
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.16);
-        color: rgba(255, 255, 255, 0.86);
-        font: 650 9px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        letter-spacing: 0.06em;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        backdrop-filter: blur(8px);
-        opacity: 0.58;
-      }
-      #status::before {
-        display: inline-block;
-        width: 5px;
-        height: 5px;
-        margin-right: 5px;
-        border-radius: 50%;
-        background: #8b5cf6;
-        content: "";
-        vertical-align: 1px;
-      }
-      #status[data-tone="running"]::before { background: #f59e0b; }
-      #status[data-tone="waiting"]::before { background: #3b82f6; }
-      #status[data-tone="running"] { opacity: 0.92; }
-      #status[data-tone="waiting"] {
+      #__browser_control_island_canvas__ {
         position: absolute;
-        right: 10px;
-        bottom: 10px;
-        width: min(300px, calc(100vw - 20px));
-        padding: 10px;
-        border-radius: 12px;
-        opacity: 1;
-        white-space: normal;
-        transform-origin: right bottom;
-        animation: handoff-enter 420ms cubic-bezier(0.22, 1, 0.36, 1);
-      }
-      :host([data-anchor="cursor"]) #status[data-tone="waiting"] {
-        right: auto;
-        bottom: auto;
-        left: var(--bc-prompt-left);
-        top: var(--bc-prompt-top);
-        transform-origin: 18px 0;
-      }
-      #vignette {
-        position: fixed;
-        inset: 0;
+        left: 0;
+        top: 0;
+        width: ${ISLAND_CANVAS_W}px;
+        height: ${ISLAND_CANVAS_H}px;
         pointer-events: none;
-        background: radial-gradient(ellipse at center, transparent 64%, rgba(37, 99, 235, 0.055) 100%);
-        box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.1), inset 0 0 64px rgba(37, 99, 235, 0.07);
-        animation: handoff-pulse 2600ms ease-in-out infinite;
       }
-      #prompt {
-        margin: 8px 0 10px;
-        color: #fff;
-        font: 500 13px/1.4 system-ui, -apple-system, sans-serif;
-        letter-spacing: normal;
+      #__browser_control_status__ {
+        position: absolute;
+        box-sizing: border-box;
+        overflow: hidden;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        color: rgba(248, 248, 250, 0.96);
+        font: 540 12.5px/1.28 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+        letter-spacing: -0.012em;
+        pointer-events: none;
+        opacity: 0;
+      }
+      #__browser_control_prompt__, #__browser_control_actions__ {
+        opacity: 0;
+        transform-origin: 50% 0%;
+        will-change: transform, opacity;
+      }
+      #__browser_control_prompt__ {
+        margin: 0;
+        color: #f4f3ef;
+        font: 560 12.5px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+        letter-spacing: -0.012em;
+        text-align: center;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #__browser_control_actions__ {
+        display: flex;
+        align-items: center;
+        gap: 6px;
       }
       button {
         box-sizing: border-box;
-        width: 100%;
-        padding: 7px 10px;
+        flex: 1;
+        padding: 5.5px 12px;
         border: 0;
-        border-radius: 7px;
-        background: #2563eb;
-        color: #fff;
+        border-radius: 999px;
+        background: #f4f3ef;
+        box-shadow: inset 0 0.5px 0 #ffffff, 0 1px 2px rgba(0, 0, 0, 0.32);
+        color: #09090b;
         cursor: pointer;
-        font: 600 13px/1.2 system-ui, -apple-system, sans-serif;
+        font: 600 11.5px/1.2 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+        letter-spacing: -0.01em;
         pointer-events: auto;
+        transition: transform ${springCss({ visualDuration: 0.3, bounce: 0.3 })}, opacity 120ms ease;
       }
-      button:hover { background: #1d4ed8; }
-      button:disabled { cursor: default; opacity: 0.72; }
-      button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-      @keyframes handoff-enter {
-        from { opacity: 0; transform: scale(0.72) translate(8px, 8px); }
-        to { opacity: 1; transform: scale(1) translate(0, 0); }
-      }
-      @keyframes handoff-pulse {
-        0%, 100% { opacity: 0.32; }
-        50% { opacity: 0.68; }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        #status[data-tone="waiting"], #vignette { animation: none; }
-      }
+      button:hover { opacity: 0.92; }
+      button:active { transform: scale(0.96); transition-duration: 90ms; transition-timing-function: ease-out; }
+      button:disabled { cursor: default; opacity: 0.65; }
+      button:focus-visible { outline: 2px solid #f4f3ef; outline-offset: 2px; }
     `
+    const canvas = document.createElement("canvas")
+    canvas.id = "__browser_control_island_canvas__"
     const status = document.createElement("div")
-    status.id = "status"
-    status.setAttribute("role", "status")
-    status.setAttribute("aria-live", "polite")
-    shadow.append(style, status)
+    status.id = "__browser_control_status__"
+    shadow.append(style, canvas, status)
+    islandRig?.destroy()
+    islandRig = new DynamicIslandRig(canvas, status)
   }
 
-  const statusElement = host.shadowRoot?.getElementById("status")
+  const statusElement = host.shadowRoot?.getElementById("__browser_control_status__")
   if (!statusElement) {
     return
   }
   const view = pageStatusView(currentStatus)
-  statusElement.replaceChildren(document.createTextNode(view.label))
+  if (collapseCleanupTimer !== undefined) {
+    clearTimeout(collapseCleanupTimer)
+    collapseCleanupTimer = undefined
+  }
+  if (view.tone === "waiting") {
+    statusElement.replaceChildren()
+  } else if (statusElement.children.length > 0) {
+    collapseCleanupTimer = setTimeout(() => {
+      statusElement.replaceChildren()
+      collapseCleanupTimer = undefined
+    }, 180)
+  }
   statusElement.title = view.title
   statusElement.setAttribute("aria-label", view.title)
   statusElement.dataset.tone = view.tone
+  host.setAttribute("aria-hidden", String(view.completion === undefined))
   host.dataset.interactive = String(view.completion !== undefined)
   host.dataset.waiting = String(view.completion !== undefined)
-  host.shadowRoot?.getElementById("vignette")?.remove()
   clearGhostCursorAttention()
   if (view.message) {
     const prompt = document.createElement("div")
-    prompt.id = "prompt"
+    prompt.id = "__browser_control_prompt__"
     prompt.textContent = view.message
     statusElement.append(prompt)
   }
   if (view.completion) {
     const completion = view.completion
+    const actionsRow = document.createElement("div")
+    actionsRow.id = "__browser_control_actions__"
     const button = document.createElement("button")
     button.type = "button"
-    button.textContent = completion.label
-    button.addEventListener("click", () => {
-      button.disabled = true
-      button.textContent = "Continuing…"
-      completeHandoff(completion.handoffId)
-    })
-    statusElement.append(button)
-    const vignette = document.createElement("div")
-    vignette.id = "vignette"
-    host.shadowRoot?.insertBefore(vignette, statusElement)
-    positionWaitingStatus(host)
+    if (pendingTabRequest) {
+      const requestId = pendingTabRequest.requestId
+      button.textContent = "Allow · ⌘↵"
+      button.addEventListener("click", () => {
+        button.disabled = true
+        button.textContent = "Attaching…"
+        decideTabRequest(requestId, true)
+      })
+      const decline = document.createElement("button")
+      decline.type = "button"
+      decline.textContent = "Not now"
+      decline.style.background = "rgba(255, 255, 255, 0.10)"
+      decline.style.boxShadow = "inset 0 0.5px 0 rgba(255, 255, 255, 0.14)"
+      decline.style.color = "#d4d4d8"
+      decline.addEventListener("click", () => {
+        decideTabRequest(requestId, false)
+      })
+      actionsRow.append(button, decline)
+    } else {
+      button.textContent = `${completion.label} · ⌘↵`
+      button.addEventListener("click", () => {
+        button.disabled = true
+        button.textContent = "Continuing…"
+        completeHandoff(completion.handoffId)
+      })
+      actionsRow.append(button)
+    }
+    statusElement.append(actionsRow)
+    const cursor = document.getElementById("__browser_control_ghost_cursor__")
+    if (cursor) highlightGhostCursor(cursor)
   }
   if (!host.isConnected) {
     document.documentElement.append(host)
   }
+  islandRig?.configure(view.tone)
   observeHost()
-}
-
-function positionWaitingStatus(host: HTMLElement): void {
-  const cursor = document.getElementById("__browser_control_ghost_cursor__")
-  const x = Number(cursor?.dataset.targetX)
-  const y = Number(cursor?.dataset.targetY)
-  if (!cursor || !Number.isFinite(x) || !Number.isFinite(y)) {
-    host.removeAttribute("data-anchor")
-    return
-  }
-  highlightGhostCursor(cursor)
-  const width = 300
-  const estimatedHeight = 132
-  const left = Math.max(10, Math.min(x + 18, window.innerWidth - width - 10))
-  const below = y + 28 + estimatedHeight <= window.innerHeight
-  const top = below ? y + 28 : Math.max(10, y - estimatedHeight - 22)
-  host.style.setProperty("--bc-prompt-left", `${left}px`)
-  host.style.setProperty("--bc-prompt-top", `${top}px`)
-  host.dataset.anchor = "cursor"
 }
 
 function highlightGhostCursor(cursor: HTMLElement): void {
   attendedCursor = cursor
   cursorFilter = cursor.style.filter
-  const path = cursor.querySelector("svg path")
-  cursorFill = path?.getAttribute("fill")
-  path?.setAttribute("fill", "#2563eb")
   const baseFilter = cursorFilter || "drop-shadow(0 2px 4px rgba(0,0,0,0.3))"
   cursorAnimation = cursor.animate(
     [
-      { filter: `${baseFilter} drop-shadow(0 0 2px rgba(37,99,235,0.45))` },
-      { filter: `${baseFilter} drop-shadow(0 0 8px rgba(37,99,235,0.95))` },
-      { filter: `${baseFilter} drop-shadow(0 0 2px rgba(37,99,235,0.45))` },
+      { filter: `${baseFilter} drop-shadow(0 0 3px rgba(244,243,239,0.25))` },
+      { filter: `${baseFilter} drop-shadow(0 0 10px rgba(244,243,239,0.65))` },
+      { filter: `${baseFilter} drop-shadow(0 0 3px rgba(244,243,239,0.25))` },
     ],
-    { duration: 1500, iterations: Infinity, easing: "ease-in-out" },
+    { duration: 1600, iterations: Infinity, easing: "ease-in-out" },
   )
 }
 
@@ -250,10 +353,35 @@ function clearGhostCursorAttention(): void {
 function clearStatus(): void {
   currentStatus = undefined
   completingHandoffId = undefined
+  if (collapseCleanupTimer !== undefined) {
+    clearTimeout(collapseCleanupTimer)
+    collapseCleanupTimer = undefined
+  }
   clearGhostCursorAttention()
   observer?.disconnect()
   observer = undefined
-  document.getElementById(hostId)?.remove()
+  const host = document.getElementById(hostId)
+  const rig = islandRig
+  islandRig = undefined
+  if (!host) {
+    rig?.destroy()
+    return
+  }
+  // Release the id so a new status can mount immediately while this island animates out.
+  host.removeAttribute("id")
+  host.inert = true
+  const remove = () => {
+    rig?.destroy()
+    host.remove()
+  }
+  if (!rig) return remove()
+  void Promise.race([rig.exit(), new Promise((resolve) => setTimeout(resolve, 700))]).then(remove)
+}
+
+function decideTabRequest(requestId: string, approved: boolean): void {
+  pendingTabRequest = undefined
+  clearStatus()
+  void chrome.runtime.sendMessage({ action: "tab-request.decision", requestId, approved }).catch(() => {})
 }
 
 function completeHandoff(handoffId: string): void {
@@ -270,10 +398,31 @@ function observeHost(): void {
   if (observer || !document.documentElement) {
     return
   }
-  observer = new MutationObserver(() => {
-    if (currentStatus && !document.getElementById(hostId)) {
+  observer = new MutationObserver((records) => {
+    if (!currentStatus) {
+      return
+    }
+    if (currentStatus.state !== "waiting") {
+      for (const record of records) {
+        if (record.type === "attributes" && record.target instanceof Element) {
+          evictForeignExtensionNodesIn(record.target, false)
+          continue
+        }
+        for (const node of record.addedNodes) {
+          if (node instanceof Element) {
+            evictForeignExtensionNodesIn(node, true)
+          }
+        }
+      }
+    }
+    if (window === window.top && !document.getElementById(hostId)) {
       renderStatus()
     }
   })
-  observer.observe(document.documentElement, { childList: true })
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["src", "data"],
+  })
 }

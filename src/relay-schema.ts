@@ -61,6 +61,7 @@ export const ExecuteRequest = Schema.Struct({
   sessionId: Schema.optionalKey(Schema.String),
   code: Schema.String,
   createIfMissing: Schema.Boolean,
+  removeAfterExecute: Schema.optionalKey(Schema.Boolean),
   targetSelection: Schema.optionalKey(TargetSelection),
 })
 
@@ -69,7 +70,7 @@ export interface ExecuteRequest extends Schema.Schema.Type<typeof ExecuteRequest
 export const SessionAdoptRequest = Schema.Struct({
   sessionId: Schema.optionalKey(Schema.String),
   createIfMissing: Schema.Boolean,
-  targetSelection: TargetSelection,
+  targetSelection: Schema.optionalKey(TargetSelection),
 })
 
 export interface SessionAdoptRequest extends Schema.Schema.Type<typeof SessionAdoptRequest> {}
@@ -87,12 +88,6 @@ export const SessionEnsureRequest = Schema.Struct({
 })
 
 export interface SessionEnsureRequest extends Schema.Schema.Type<typeof SessionEnsureRequest> {}
-
-export const SessionEnsureResponse = Schema.Struct({
-  session: SessionSummary,
-})
-
-export interface SessionEnsureResponse extends Schema.Schema.Type<typeof SessionEnsureResponse> {}
 
 export const SessionIdRequest = Schema.Struct({
   id: Schema.String,
@@ -185,8 +180,11 @@ export const AuthenticatedJsonRequest = Schema.Struct({
   startUrl: Schema.optionalKey(Schema.NonEmptyString),
   method: AuthenticatedJsonMethod,
   path: Schema.NonEmptyString,
+  headers: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
   body: Schema.optionalKey(Schema.Json),
   sensitive: Schema.optionalKey(Schema.Boolean),
+  handoffOnAuthFailure: Schema.optionalKey(Schema.Boolean),
+  handoffMessage: Schema.optionalKey(Schema.String),
   timeoutMs: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 120_000 }))),
   maxResponseBytes: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 10_000_000 }))),
 })
@@ -344,6 +342,16 @@ export const AuthProfileSummary = Schema.Struct({
 })
 export interface AuthProfileSummary extends Schema.Schema.Type<typeof AuthProfileSummary> {}
 
+const NetworkEndpointDigest = Schema.Struct({
+  method: Schema.String,
+  url: Schema.String,
+  status: Schema.optionalKey(Schema.Number),
+  count: Schema.Number,
+  requestHeaders: Schema.optionalKey(Schema.Array(Schema.String)),
+  requestKeys: Schema.optionalKey(Schema.Array(Schema.String)),
+  responseKeys: Schema.optionalKey(Schema.Array(Schema.String)),
+})
+
 export const NetworkStopResponse = NetworkStatusResponse.pipe(Schema.fieldsAssign({
   active: Schema.Literal(false),
   stoppedAt: Schema.String,
@@ -351,6 +359,7 @@ export const NetworkStopResponse = NetworkStatusResponse.pipe(Schema.fieldsAssig
   authProfile: Schema.optionalKey(AuthProfileSummary),
   updatedSecretRefs: Schema.Array(Schema.String),
   observedSecretRefs: Schema.Array(Schema.String),
+  endpoints: Schema.optionalKey(Schema.Array(NetworkEndpointDigest)),
 }))
 export interface NetworkStopResponse extends Schema.Schema.Type<typeof NetworkStopResponse> {}
 

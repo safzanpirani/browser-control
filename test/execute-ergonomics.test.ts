@@ -7,6 +7,7 @@ import {
   defaultAriaSnapshotTimeoutMs,
   fillInputs,
   formatNodeContextWarning,
+  formatPointerInterceptionWarning,
   pageTargetId,
   runUserCode,
 } from "../src/execute.ts"
@@ -142,8 +143,12 @@ describe("user code execution", () => {
 
     expect(formatNodeContextWarning(await failure("return window.location.href"))).toContain("`window` is undefined")
     expect(formatNodeContextWarning(await failure('return await fetch("/api/me")'))).toContain("page.evaluate(() => fetch(...))")
+    expect(formatNodeContextWarning(Object.assign(new TypeError('The "cb" argument must be of type function. Received undefined'), { name: "TypeError" }))).toContain("fs.promises.writeFile")
     expect(formatNodeContextWarning(await failure("return missingHelper()"))).toBeUndefined()
     expect(formatNodeContextWarning(new Error("page.evaluate: ReferenceError: window is not defined"))).toBeUndefined()
+    expect(formatPointerInterceptionWarning(new Error(
+      "locator.click: Timeout 30000ms exceeded.\nCall log:\n  - <div id=\"cookie-banner\">...</div> from <div id=\"portal\">...</div> intercepts pointer events",
+    ))).toContain("<div id=\"cookie-banner\">...</div> from <div id=\"portal\">...</div> intercepts pointer events")
   })
 })
 

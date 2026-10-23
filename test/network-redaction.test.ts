@@ -208,6 +208,7 @@ describe("SecretCollector", () => {
       { ref: "BC_SECRET_3", value: "session-cookie-value" },
     ]
     expect(redactKnownValues("Flat 30% off, rated 4.1, dark mode", slots)).toBe("Flat 30% off, rated 4.1, dark mode")
+    expect(redactKnownValues("https://example.com/v1/dark-mode?limit=10", slots)).toBe("https://example.com/v1/dark-mode?limit=10")
     expect(redactKnownValues("with 10 client headers sid=session-cookie-value", slots))
       .toBe("with 10 client headers sid=${BC_SECRET_3}")
   })
