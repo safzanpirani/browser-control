@@ -12,7 +12,7 @@ import {
   replayTargetCreated,
 } from "./cdp-shims.ts"
 import { CdpClientPool } from "./cdp-client-pool.ts"
-import { CdpRouter, isRootRoutableBrowserContextMethod, tabScopedCookieCommand } from "./cdp-router.ts"
+import { appliesToFocusedProfile, CdpRouter, isRootRoutableBrowserContextMethod, tabScopedCookieCommand, unfocusedProfilePermissionMessage } from "./cdp-router.ts"
 import { CdpRuntime } from "./cdp-runtime.ts"
 import { ExtensionRpc } from "./extension-rpc.ts"
 import { createHttpRequestHandler } from "./http-api.ts"
@@ -797,6 +797,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
     extensionRpc.markHandshake(
       typeof message.params?.version === "string" ? message.params.version : undefined,
       message.params?.protocolVersion,
+      message.params?.capabilities,
     )
     return extensionGeneration
   }
@@ -1354,6 +1355,12 @@ const makeRelay = Effect.fnUntraced(function* (options: {
         : `CDP sessionId is required for ${message.method}`))
     }
     const { tabId } = route
+    // Older extensions cannot report focus; their permission commands keep
+    // Chrome's last-focused-profile behaviour, which the docs describe.
+    if (appliesToFocusedProfile(message.method) && extensionRpc.supports("windows.focusState")) {
+      const focus = yield* sendToExtension({ method: "windows.focusState", params: {} })
+      if (focus.focused !== true) return yield* Effect.fail(new Error(unfocusedProfilePermissionMessage(message.method)))
+    }
     // A validated root route already matched any requested context; an explicit
     // context on a plain tab session is left for Chrome to reject.
     const { method, params } = rootRoutable || requestedBrowserContextId === undefined

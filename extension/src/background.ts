@@ -1,4 +1,4 @@
-import { extensionProtocolVersion, parseExtensionCommand, type ExtensionCommand as ShimCommand, type JsonObject } from "../../src/protocol.ts"
+import { extensionCapabilities, extensionProtocolVersion, parseExtensionCommand, type ExtensionCommand as ShimCommand, type JsonObject } from "../../src/protocol.ts"
 import { encodeRecordingFrame } from "../../src/recording-protocol.ts"
 import type {
   OffscreenCancelRecordingResult,
@@ -205,6 +205,7 @@ async function announceHelloAndAttachedTabs(currentSocket: WebSocket, currentGen
     params: {
       version: chrome.runtime.getManifest().version,
       protocolVersion: extensionProtocolVersion,
+      capabilities: [...extensionCapabilities],
     },
   })
   await completeExtensionHandshake({
@@ -383,6 +384,12 @@ async function handleCommand(command: ShimCommand, currentSocket: WebSocket): Pr
   }
   if (command.method === "recording.cancel") {
     return cancelRecording(command.params)
+  }
+  if (command.method === "windows.focusState") {
+    // This extension instance only sees its own profile's windows, so this is
+    // true exactly when one of this profile's windows has OS focus.
+    const lastFocused = await chrome.windows.getLastFocused()
+    return { focused: lastFocused.focused === true }
   }
   throw new Error(`Unknown shim command: ${command.method}`)
 }

@@ -313,15 +313,51 @@ describe("relay target visibility pruning", () => {
       }
     })))
   })
+
+  it.each([true, false])("checks profile focus before forwarding permission commands (focused: %s)", async (focused) => {
+    const port = 24_000 + Math.floor(Math.random() * 10_000)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const relay = yield* startRelay({ port, sessionCatalogPath: null })
+      const extension = yield* Effect.promise(() => connectFakeExtension(relay.url, { focused }))
+      const sessionClient = yield* Effect.promise(() => connectCdpClient(relay.url, "session-a"))
+
+      try {
+        yield* Effect.promise(() => sendCdp(sessionClient, { id: 1, method: "Target.createTarget", params: { url: "about:blank" } }))
+        extension.commands.length = 0
+        const commands: CdpRequest[] = [
+          { id: 2, method: "Browser.grantPermissions", params: { origin: "https://example.com", permissions: ["geolocation"] } },
+          { id: 3, method: "Browser.resetPermissions", params: {} },
+        ]
+        for (const command of commands) {
+          const response = sendCdp(sessionClient, command)
+          if (focused) {
+            yield* Effect.promise(() => response)
+          } else {
+            yield* Effect.promise(async () => {
+              await expect(response).rejects.toThrow(`Browser Control refused ${command.method}: Chrome applies permission changes to the most recently focused profile`)
+            })
+          }
+        }
+
+        expect(extension.commands.filter((command) => command.method === "windows.focusState")).toHaveLength(commands.length)
+        const forwarded = extension.commands.filter((command) => command.method === "debugger.sendCommand").map((command) => command.params?.method)
+        expect(forwarded).toEqual(focused ? commands.map((command) => command.method) : [])
+      } finally {
+        sessionClient.close()
+        extension.close()
+      }
+    })))
+  })
 })
 
-function connectFakeExtension(relayUrl: string): Promise<WebSocket & { readonly commands: ExtensionCommand[] }> {
+function connectFakeExtension(relayUrl: string, options: { readonly focused?: boolean } = {}): Promise<WebSocket & { readonly commands: ExtensionCommand[] }> {
   return new Promise((resolve, reject) => {
     let nextTabId = 1
     const commands: ExtensionCommand[] = []
     const socket = new WebSocket(`${relayUrl.replace(/^http/, "ws")}/extension`, { origin: "chrome-extension://browser-control-test" })
     socket.on("open", () => {
-      socket.send(JSON.stringify({ method: "hello", params: { version: "test", protocolVersion: 2 } }))
+      const capabilities = options.focused === undefined ? {} : { capabilities: ["windows.focusState"] }
+      socket.send(JSON.stringify({ method: "hello", params: { version: "test", protocolVersion: 2, ...capabilities } }))
       resolve(Object.assign(socket, { commands }))
     })
     socket.on("error", reject)
@@ -332,6 +368,9 @@ function connectFakeExtension(relayUrl: string): Promise<WebSocket & { readonly 
       let result: JsonObject = {}
       if (command.method === "tabs.create") {
         result = { tabId: nextTabId++ }
+      }
+      if (command.method === "windows.focusState") {
+        result = { focused: options.focused === true }
       }
       if (command.method === "debugger.sendCommand" && params?.method === "Target.getTargetInfo") {
         const tabId = typeof params.tabId === "number" ? params.tabId : 0

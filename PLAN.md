@@ -265,6 +265,8 @@ route through several visible roots only when every root proves the same
 Chromium context; crashed roots never satisfy context routing. Cookie reads and
 writes go to the routed tab as `Network.getAllCookies`/`Network.setCookies`,
 because Chrome resolves `Storage` cookie commands to the last-focused profile.
+Permission commands have no tab-scoped form, so the relay refuses them unless
+the extension reports that a window of its profile has focus.
 
 ### CDP client state is isolated per connection
 

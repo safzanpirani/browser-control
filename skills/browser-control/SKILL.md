@@ -122,6 +122,9 @@ When several profiles share one Chrome, `context.cookies()` and
 `context.addCookies()` read and write the session page's profile. Chrome has no
 tab-scoped permission command, so `context.grantPermissions()` and
 `context.clearPermissions()` apply to the most recently focused profile window.
+The relay refuses them with "no window of this session's profile is focused"
+unless that profile has focus; ask the user to focus a window of that profile,
+then retry.
 
 Completion: the selected page URL is the intended page, and later work either
 retains the returned session id or intentionally uses the MCP process session.

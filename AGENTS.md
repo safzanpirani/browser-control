@@ -103,7 +103,10 @@ local Node relay.
   remain visible and explicitly targetable but never satisfy context routing.
   Chrome resolves `Storage.getCookies`/`setCookies` on a tab session to the
   last-focused profile, so the relay sends them as `Network.getAllCookies`/
-  `Network.setCookies`, which use the tab's own profile.
+  `Network.setCookies`, which use the tab's own profile. Permission commands
+  (`Browser.grantPermissions`/`resetPermissions`/`setPermission`) have no
+  tab-scoped form, so when the extension advertises the `windows.focusState`
+  capability the relay refuses them unless a window of its profile is focused.
 - Human handoff waiters live in `src/handoff.ts`; derive their stable CDP target
   id from the actual Playwright `Page`, then bind the exact registry
   target/tab/session. The relay resolves only a matching handoff id from that
