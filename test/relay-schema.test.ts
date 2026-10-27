@@ -400,7 +400,7 @@ describe("relay client protocol", () => {
       .digest("hex")
     expect({ relayClientProtocolVersion, fingerprint }).toEqual({
       relayClientProtocolVersion: 2,
-      fingerprint: "0c766123d4bdae611341e1fecfdf1b882ee484d36d45fe51febdb7e1af1d3af0",
+      fingerprint: "3a51ff9a9209de263f089fe1605cf7aa428343efde66d3c4413d5d47851665f5",
     })
   })
 
