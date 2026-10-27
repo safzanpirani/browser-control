@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { NodeRuntime, NodeServices } from "@effect/platform-node"
 import { Config, Console, Effect, FileSystem, Layer, Option, Predicate, Result, Schema } from "effect"
-import { Argument, Command, Flag } from "effect/cli"
+import { Argument, CliError, Command, Flag } from "effect/cli"
 import path from "node:path"
 import process from "node:process"
 import { fileURLToPath } from "node:url"
@@ -12,9 +12,11 @@ import { isValidSessionId, parseAdditionalExtensionOrigins } from "./relay-helpe
 import * as RelayLifecycle from "./relay-lifecycle.ts"
 import type { ExecuteAftermath, ExecuteLogEntry, ExecuteResponse, NetworkStatusResponse, NetworkStopResponse, RecordingQuality } from "./relay-schema.ts"
 import { startRelay } from "./relay.ts"
+import { installSignalDeadline, shutdownTimeoutConfig } from "./relay-shutdown.ts"
 import { defaultJournalBaseDir, formatJournalEntry, readJournalEntries } from "./session-journal.ts"
 import * as SessionStore from "./session-store.ts"
 import { browserControlVersion } from "./version.ts"
+import { ExitCode, failure, printJson, takeJsonFlag } from "./control-contract.ts"
 
 const packageRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const sessionIdConfig = Config.option(Config.String("BROWSER_CONTROL_SESSION"))
@@ -33,8 +35,34 @@ const tabIdFlag = (description?: string) => {
   return description ? flag.pipe(Flag.withDescription(description)) : flag
 }
 const failExit = Effect.sync(() => {
-  process.exitCode = 1
+  process.exitCode = ExitCode.failure
 })
+const exitWith = (code: number) => Effect.sync(() => {
+  process.exitCode = code
+})
+
+const hostErrorTags = new Set(["RelayClient.RelayUnreachable", "RelayLifecycle.RelayStartFailed", "RelayLifecycle.ExtensionDisconnected"])
+
+/** control-kit exit codes: 4 when the relay or extension can't be reached, otherwise 1. */
+export function exitCodeForError(error: unknown): number {
+  const tag = Predicate.isObject(error) && Predicate.hasProperty(error, "_tag") ? error._tag : undefined
+  return Predicate.isString(tag) && hostErrorTags.has(tag) ? ExitCode.host : ExitCode.failure
+}
+
+/** `--json` may come before the subcommand, which Effect CLI rejects, so move it after the command's own arguments. */
+export function hoistJsonFlag(args: ReadonlyArray<string>): { readonly json: boolean; readonly argv: ReadonlyArray<string> } {
+  const delimiter = args.indexOf("--")
+  const { json, argv } = takeJsonFlag(delimiter === -1 ? args : args.slice(0, delimiter))
+  if (!json) return { json, argv: args }
+  return { json, argv: [...argv, "--json", ...(delimiter === -1 ? [] : args.slice(delimiter))] }
+}
+
+// Written directly so the line survives --json mode, where Console.log is silenced.
+const stderrLine = (message: string) => Effect.sync(() => {
+  process.stderr.write(`browser-control: ${message.split("\n")[0]!.slice(0, 300)}\n`)
+})
+const emitJson = (value: unknown) => Effect.sync(() => printJson(value))
+const printOr = (json: boolean, value: unknown, text: string) => json ? emitJson(value) : Console.log(text)
 
 export function resolveExplicitSessionSelector(options: {
   readonly positional: string | undefined
@@ -249,8 +277,10 @@ const serve = Command.make(
   Effect.fn("Cli.serve")(function* () {
     const port = yield* RelayClient.portConfig
     const additionalExtensionOrigins = parseAdditionalExtensionOrigins(yield* RelayClient.extensionOriginsConfig)
+    const shutdownTimeoutMs = yield* shutdownTimeoutConfig
     yield* Effect.scoped(
       Effect.gen(function* () {
+        yield* installSignalDeadline(Math.max(0, shutdownTimeoutMs) + 5_000)
         const relay = yield* startRelay({ port, additionalExtensionOrigins })
         yield* Console.log(`browser-control relay listening at ${relay.url}`)
         yield* Console.log("Load extension/dist as an unpacked extension and click the toolbar button to attach a tab.")
@@ -339,20 +369,20 @@ const execute = Command.make(
       return result
     })
     if (json) {
-      const envelope = yield* run.pipe(
-        Effect.map(executeJsonEnvelope),
-        Effect.catch((error) => Effect.succeed(errorJsonEnvelope(error))),
-      )
-      yield* Console.log(JSON.stringify(envelope, null, 2))
+      const outcome = yield* Effect.result(run)
+      const envelope = Result.isFailure(outcome) ? errorJsonEnvelope(outcome.failure) : executeJsonEnvelope(outcome.success)
+      // printJson writes synchronously, so large envelopes survive a piped stdout.
+      yield* Effect.sync(() => printJson(envelope))
       if (!envelope.ok) {
-        yield* failExit
+        yield* stderrLine(envelope.error?.message ?? envelope.text)
+        yield* exitWith(Result.isFailure(outcome) ? exitCodeForError(outcome.failure) : ExitCode.failure)
       }
       return
     }
     const outcome = yield* Effect.result(run)
     if (Result.isFailure(outcome)) {
       yield* Console.error(outcome.failure.message)
-      yield* failExit
+      yield* exitWith(exitCodeForError(outcome.failure))
       return
     }
     const result = outcome.success
@@ -403,7 +433,7 @@ const sessionList = Command.make(
     const sessions = yield* relay.sessions
     const current = yield* store.read
     if (json) {
-      yield* Console.log(JSON.stringify({ current: current ?? undefined, sessions }, null, 2))
+      yield* emitJson({ current: current ?? undefined, sessions })
       return
     }
     if (sessions.length === 0) {
@@ -533,27 +563,27 @@ const status = Command.make(
     if (Result.isFailure(relayResult)) {
       if (!(relayResult.failure instanceof RelayClient.RelayUnreachable)) {
         if (json) {
-          yield* Console.log(JSON.stringify({
+          yield* emitJson({
             endpoint: relay.endpoint,
             relay: { running: false, error: relayResult.failure.message },
             extension: null,
             sessions: [],
             targets: [],
-          }, null, 2))
-        } else {
-          yield* Console.error(`Relay status failed: ${relayResult.failure.message}`)
+          })
         }
-        yield* failExit
+        yield* stderrLine(`Relay status failed: ${relayResult.failure.message}`)
+        yield* exitWith(ExitCode.host)
         return
       }
       const stopped = RelayLifecycle.stoppedRelayStatus(relay.endpoint)
       if (json) {
-        yield* Console.log(JSON.stringify(stopped, null, 2))
+        yield* emitJson(stopped)
+        yield* stderrLine(`relay is not running at ${relay.endpoint}`)
       } else {
         yield* Console.log(`Relay: stopped (${relay.endpoint})`)
         yield* Console.log("Run browser-control execute to start it automatically.")
       }
-      yield* failExit
+      yield* exitWith(ExitCode.host)
       return
     }
     const version = relayResult.success
@@ -564,15 +594,16 @@ const status = Command.make(
       ? [collections.sessions, collections.targets]
       : yield* Effect.all([relay.sessions, relay.targets])
     if (json) {
-      yield* Console.log(JSON.stringify({
+      yield* emitJson({
         endpoint: relay.endpoint,
-        relay: { running: true, version: version.version, buildId: version.buildId ?? null, clientProtocol: version.clientProtocol ?? null, stale: buildProblem !== undefined },
+        relay: { running: true, version: version.version, buildId: version.buildId ?? null, clientProtocol: version.clientProtocol ?? null, stale: buildProblem !== undefined, drain: version.drain ?? null },
         extension: extensionStatus,
         currentSession: current ?? null,
         sessions,
         targets,
-      }, null, 2))
+      })
       if (buildProblem) {
+        yield* stderrLine(buildProblem)
         yield* failExit
       }
       return
@@ -583,6 +614,10 @@ const status = Command.make(
     } else {
       const buildDrift = RelayLifecycle.relayBuildDrift(version)
       if (buildDrift) yield* Console.log(`Note: ${buildDrift}`)
+    }
+    const drainProblem = RelayLifecycle.relayDrainProblem(version)
+    if (drainProblem) {
+      yield* Console.log(`Warning: ${drainProblem}`)
     }
     yield* Console.log(`Extension: ${extensionStatus.connected ? "connected" : "disconnected"}${extensionStatus.version ? ` (${extensionStatus.version})` : ""}`)
     if ((extensionStatus.rejectedConnections ?? 0) > 0) {
@@ -663,7 +698,7 @@ const recordingStart = Command.make(
     if (!result.success) {
       return yield* Effect.fail(new Error(result.error ?? "Failed to start recording"))
     }
-    yield* Console.log(json ? JSON.stringify(result, null, 2) : `Recording started: ${result.path ?? resolvedOutputPath} tab=${result.tabId ?? "unknown"} mode=${result.mode ?? "tab-capture"} artifact=${result.artifactType ?? "webm"} mime=${result.mimeType ?? "video/webm"} fps=${result.frameRate ?? "unknown"}`)
+    yield* printOr(json, result, `Recording started: ${result.path ?? resolvedOutputPath} tab=${result.tabId ?? "unknown"} mode=${result.mode ?? "tab-capture"} artifact=${result.artifactType ?? "webm"} mime=${result.mimeType ?? "video/webm"} fps=${result.frameRate ?? "unknown"}`)
   }),
 ).pipe(Command.withDescription("Start recording an attached tab"))
 
@@ -682,7 +717,7 @@ const recordingStop = Command.make(
     if (!result.success) {
       return yield* Effect.fail(new Error(result.error ?? "Failed to stop recording"))
     }
-    if (json) return yield* Console.log(JSON.stringify(result, null, 2))
+    if (json) return yield* emitJson(result)
     const frames = result.frameCount === undefined ? "" : `, frames=${result.frameCount}`
     yield* Console.log(`Recording saved: ${result.path ?? "unknown"} (${result.size ?? 0} bytes, ${result.duration ?? 0}ms, mode=${result.mode ?? "tab-capture"}, artifact=${result.artifactType ?? "webm"}${frames})`)
     yield* Console.log(formatRecordingQuality(result.quality))
@@ -702,7 +737,7 @@ const recordingStatus = Command.make(
     const target = yield* recordingTarget({ session, tabId })
     const result = yield* relay.recordingStatus(target)
     if (json) {
-      yield* Console.log(JSON.stringify(result, null, 2))
+      yield* emitJson(result)
       return
     }
     if (!result.isRecording) {
@@ -756,7 +791,7 @@ const flightRecorderStart = Command.make(
       ...(Option.isSome(retentionMs) ? { retentionMs: retentionMs.value } : {}),
       ...(Option.isSome(frameRate) ? { frameRate: frameRate.value } : {}),
     })
-    yield* Console.log(json ? JSON.stringify(result, null, 2) : `Flight recorder buffering tab ${result.tabId}; retention=${result.retentionMs}ms`)
+    yield* printOr(json, result, `Flight recorder buffering tab ${result.tabId}; retention=${result.retentionMs}ms`)
   }),
 ).pipe(Command.withDescription("Start a rolling in-memory video buffer"))
 
@@ -771,7 +806,7 @@ const flightRecorderStatus = Command.make(
     const relay = yield* RelayClient.Service
     yield* ensureCliRelay()
     const result = yield* relay.flightRecorderStatus(yield* recordingTarget({ session, tabId }))
-    if (json) return yield* Console.log(JSON.stringify(result, null, 2))
+    if (json) return yield* emitJson(result)
     if (!result.active) return yield* Console.log("Flight recorder inactive")
     yield* Console.log(`Flight recorder tab=${result.tabId} frames=${result.bufferedFrames} retained=${result.retainedDurationMs}ms bytes=${result.bufferedBytes}`)
   }),
@@ -794,7 +829,7 @@ const flightRecorderSaveLast = Command.make(
       outputPath: path.resolve(outputPath),
       ...(Option.isSome(durationMs) ? { durationMs: durationMs.value } : {}),
     })
-    yield* Console.log(json ? JSON.stringify(result, null, 2) : `Saved ${result.durationMs}ms flight recorder clip (${result.frameCount} frames) to ${result.path}`)
+    yield* printOr(json, result, `Saved ${result.durationMs}ms flight recorder clip (${result.frameCount} frames) to ${result.path}`)
   }),
 ).pipe(Command.withDescription("Save the most recent buffered video without stopping the recorder"))
 
@@ -864,7 +899,7 @@ const networkStart = Command.make(
       ...(Option.isSome(maxTotalBodyBytes) ? { maxTotalBodyBytes: maxTotalBodyBytes.value } : {}),
       ...(Option.isSome(maxEntries) ? { maxEntries: maxEntries.value } : {}),
     })
-    yield* Console.log(json ? JSON.stringify(result, null, 2) : formatNetworkStatus(result))
+    yield* printOr(json, result, formatNetworkStatus(result))
   }),
 ).pipe(Command.withDescription("Start session-scoped network capture"))
 
@@ -879,7 +914,7 @@ const networkStatus = Command.make(
     const sessionId = yield* networkSession(session)
     yield* ensureCliRelay()
     const result = yield* relay.networkStatus({ sessionId })
-    yield* Console.log(json ? JSON.stringify(result, null, 2) : formatNetworkStatus(result))
+    yield* printOr(json, result, formatNetworkStatus(result))
   }),
 ).pipe(Command.withDescription("Show session-scoped network capture status"))
 
@@ -905,7 +940,7 @@ const networkStop = Command.make(
       ...(outputValue ? { outputPath: path.resolve(outputValue) } : {}),
       ...(secretsValue ? { secrets: secretsValue } : {}),
     })
-    yield* Console.log(json ? JSON.stringify(result, null, 2) : formatNetworkResult(result))
+    yield* printOr(json, result, formatNetworkResult(result))
   }),
 ).pipe(Command.withDescription("Stop capture and write a redacted artifact or reusable secret profile"))
 
@@ -937,7 +972,7 @@ const secretsStatus = Command.make(
     yield* ensureCliRelay()
     const result = yield* relay.authStatus({ name })
     if (json) {
-      yield* Console.log(JSON.stringify(result, null, 2))
+      yield* emitJson(result)
       return
     }
     yield* Console.log(`Secrets profile ${result.name}: slots=${result.slotCount} updatedAt=${result.updatedAt}`)
@@ -964,7 +999,7 @@ const secretsRefresh = Command.make(
       ...(Option.isSome(urlFilter) ? { urlFilter: urlFilter.value } : {}),
       ...(Option.isSome(timeoutMs) ? { timeoutMs: timeoutMs.value } : {}),
     })
-    yield* Console.log(json ? JSON.stringify(result, null, 2) : `Secrets profile ${name} refreshed: observed=${result.observedSecretRefs.length} changed=${result.updatedSecretRefs.length}`)
+    yield* printOr(json, result, `Secrets profile ${name} refreshed: observed=${result.observedSecretRefs.length} changed=${result.updatedSecretRefs.length}`)
   }),
 ).pipe(Command.withDescription("Reload a session page and refresh a profile while preserving stable references"))
 
@@ -1016,7 +1051,7 @@ const journal = Command.make(
       catch: (cause) => new Error(`read session journal for ${sessionId}`, { cause }),
     })
     if (json) {
-      yield* Console.log(JSON.stringify({ session: sessionId, entries }, null, 2))
+      yield* emitJson({ session: sessionId, entries })
       return
     }
     if (entries.length === 0) {
@@ -1038,7 +1073,7 @@ const doctor = Command.make(
   Effect.fn("Cli.doctor")(function* ({ json }) {
     const report = yield* createDoctorReport({ packageRoot })
     if (json) {
-      yield* Console.log(JSON.stringify(report, null, 2))
+      yield* emitJson(report)
     } else {
       yield* Console.log(formatDoctorReport(report))
     }
@@ -1079,12 +1114,44 @@ const mainLayer = Layer.mergeAll(RelayClient.layerFetch, SessionStore.layer).pip
   Layer.provideMerge(NodeServices.layer),
 )
 
-Command.runWith(browserControl, { version: browserControlVersion })(normalizeCliArguments(process.argv.slice(2))).pipe(
-  Effect.catchTags({
-    "RelayClient.RelayRejected": (error) => Console.error(error.message).pipe(Effect.andThen(failExit)),
-    "RelayClient.RelayUnreachable": (error) => Console.error(error.message).pipe(Effect.andThen(failExit)),
-    "RelayClient.RelayDecodeFailed": (error) => Console.error(error.message).pipe(Effect.andThen(failExit)),
-  }),
+const cliArgs = hoistJsonFlag(process.argv.slice(2))
+const subcommand = cliArgs.argv.find((arg) => !arg.startsWith("-"))
+const commandName = subcommand ? `browser-control ${subcommand}` : "browser-control"
+
+// Effect CLI parse errors exit 2 and, in --json mode, print a control-kit failure envelope.
+const reportUsageError = (error: CliError.CliError) => Effect.gen(function* () {
+  const errors = error._tag === "ShowHelp" ? error.errors : [error]
+  if (errors.length === 0) return
+  const message = errors.map((e) => e.message).join("; ")
+  if (cliArgs.json) {
+    yield* emitJson(failure(commandName, "usage", message, { exitCode: ExitCode.usage }))
+    yield* stderrLine(message)
+  }
+  yield* exitWith(ExitCode.usage)
+})
+
+// Command failures that weren't handled in place: a failure envelope in --json mode, the message on stderr, exit 1 or 4.
+const reportFailure = (error: unknown) => Effect.gen(function* () {
+  const message = error instanceof Error ? error.message : String(error)
+  const exitCode = exitCodeForError(error)
+  if (cliArgs.json) {
+    yield* emitJson(failure(commandName, exitCode === ExitCode.host ? "relay_unavailable" : "error", message, { exitCode }))
+    yield* stderrLine(message)
+  } else {
+    yield* Console.error(message)
+  }
+  yield* exitWith(exitCode)
+})
+
+const silent = () => {}
+const askedForHelp = cliArgs.argv.some((arg) => arg === "--help" || arg === "-h")
+const quietJson = cliArgs.json && !askedForHelp
+
+Command.runWith(browserControl, { version: browserControlVersion, renderErrors: !quietJson })(normalizeCliArguments(cliArgs.argv)).pipe(
+  // --json mode: stdout carries only printJson output, so silence Effect CLI's help text.
+  quietJson ? Effect.provideService(Console.Console, { ...globalThis.console, log: silent }) : (effect) => effect,
+  Effect.catchIf(CliError.isCliError, reportUsageError),
+  Effect.catch(reportFailure),
   Effect.provide(mainLayer),
   NodeRuntime.runMain,
 )

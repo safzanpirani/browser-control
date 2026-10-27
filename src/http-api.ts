@@ -84,6 +84,7 @@ export function createHttpRequestHandler(options: {
       runRequestEffect(response, observational ? effect : options.shutdown.track(settle ? Effect.uninterruptible(effect) : effect))
     }
     if (pathname === "/" || pathname === "/version") {
+      const drain = options.shutdown.status()
       sendJson(response, {
         version: browserControlVersion,
         buildId: browserControlBuildId,
@@ -93,6 +94,7 @@ export function createHttpRequestHandler(options: {
         managed: options.relayInstance.managed,
         shutdownProtocol: 2,
         clientProtocol: relayClientProtocolVersion,
+        ...(drain ? { drain } : {}),
       })
       return
     }

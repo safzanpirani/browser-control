@@ -53,6 +53,14 @@ Agent / MCP client / CLI
   rebuild changes the build id; only an incompatible protocol (or a legacy relay
   without one from another build) blocks relay-backed commands, and `doctor`
   still notes build drift.
+- A signalled relay (SIGTERM/SIGINT, including the self-signal after an accepted
+  restart) gives accepted work `BROWSER_CONTROL_SHUTDOWN_TIMEOUT_MS` (default
+  10s) to settle, then forces teardown and records `ShutdownForced` with the
+  holders in `lifecycle.jsonl`. Persisted session ownership is frozen first so
+  idle and stuck sessions reattach after restart. The `serve` entrypoint exits
+  on a second signal or 5s past the deadline. `/version` reports `drain`
+  (phase, start, elapsed, holders) while admission is closed, and `status` and
+  `doctor` surface it.
 - Runtime candidates are built and validated outside the live checkout via
   `pnpm runtime:prepare` and activated atomically for future CLI/MCP processes
   via `pnpm runtime:select`.
