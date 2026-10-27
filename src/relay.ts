@@ -463,6 +463,9 @@ const makeRelay = Effect.fnUntraced(function* (options: {
       onSessionsChanged: async (entries) => {
         if (catalogWritesEnabled) await sessionCatalog?.save(entries)
       },
+      cancelPendingHandoff: (sessionId, operation) => {
+        handoffs.cancelForSession(sessionId, operation === "delete" ? "session-deleted" : "session-reset")
+      },
     },
     registry,
   )

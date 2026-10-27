@@ -214,6 +214,18 @@ describe("HandoffRegistry", () => {
     expect(registry.pendingCount).toBe(0)
   })
 
+  it("cancels only the named session's waiter when its session is deleted or reset", async () => {
+    const registry = registryWithIds("handoff-1", "handoff-2")
+    const alpha = registry.wait({ sessionId: "alpha", tabId: 7, targetId: "target-7", targetSessionId: "bc-tab-7", message: "one", timeoutMs: 5_000 })
+    const beta = registry.wait({ sessionId: "beta", tabId: 8, targetId: "target-8", targetSessionId: "bc-tab-8", message: "two", timeoutMs: 5_000 })
+
+    expect(registry.cancelForSession("alpha", "session-deleted")).toEqual(expect.objectContaining({ id: alpha.id, sessionId: "alpha", tabId: 7 }))
+    expect(registry.cancelForSession("missing", "session-reset")).toBeUndefined()
+    await expect(alpha.outcome).resolves.toEqual({ type: "cancelled", reason: "session-deleted" })
+    expect(registry.pendingForSession("beta")?.id).toBe(beta.id)
+    expect(registry.pendingCount).toBe(1)
+  })
+
   it("does not cancel a replacement target generation that reused the tab", async () => {
     const registry = registryWithIds("handoff-1")
     const wait = registry.wait({ sessionId: "alpha", tabId: 7, targetId: "target-7", targetSessionId: "bc-tab-new", message: "m", timeoutMs: 5_000 })

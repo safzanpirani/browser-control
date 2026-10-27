@@ -283,7 +283,9 @@ now identifies its replacement.
 Tell the user what action is waiting. Human acknowledgment is not verification:
 always assert the expected URL or stable element after `handoff`. If the action
 was already completed and only the human step remains, call `handoff(message)`
-without `start`. The default timeout is ten minutes.
+without `start`. The default timeout is ten minutes. Killing the CLI does not
+end a waiting handoff; `session delete` or `session reset` cancels it and fails
+that execute.
 
 Completion: the prompt was presented only after WAIT was registered, the action
 settled, and the authenticated result was independently verified.

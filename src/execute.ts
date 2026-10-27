@@ -270,8 +270,11 @@ export async function finishHandoff(options: {
     throw new Error(`Handoff timed out after ${options.timeoutMs}ms waiting for the user: ${options.message}`)
   }
   if (options.outcome !== "resolved") {
-    const targetEvent = options.outcome.reason === "target-crashed" ? "crashed" : "detached"
-    throw new Error(`Handoff cancelled because its target ${targetEvent}: ${options.message}`)
+    const { reason } = options.outcome
+    const cause = reason === "session-deleted" || reason === "session-reset"
+      ? `its session was ${reason === "session-deleted" ? "deleted" : "reset"}`
+      : `its target ${reason === "target-crashed" ? "crashed" : "detached"}`
+    throw new Error(`Handoff cancelled because ${cause}: ${options.message}`)
   }
   const contextTimeoutMs = options.contextTimeoutMs ?? sessionPageHealthCheckTimeoutMs
   try {

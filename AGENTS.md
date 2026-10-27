@@ -97,6 +97,9 @@ After pushing, update the installed copy. See `~/code/control/AGENTS.md`.
 - Reset/delete/idle cleanup closes every registry target owned by the session
   with `owner: "relay"`. Idle TTL is 15 minutes for all names; sandbox state and
   CDP connections are released. Idle user tabs detach without closing.
+- Session delete/reset first cancel the session's pending human handoff
+  (`session-deleted`/`session-reset`), which fails that execute and releases its
+  permit, so a handoff nobody will complete cannot lock the session.
 - Focus emulation is scoped to active execute work. Group updates preserve the
   user's collapsed state. Startup orphan cleanup requires exact relay ownership.
 - Never auto-collapse Browser Control tab groups (`collapsed: true`) in

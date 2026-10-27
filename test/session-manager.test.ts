@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 import { Deferred, Effect, Exit, Fiber, Latch, Match, Result, Scheduler } from "effect"
 import { TestClock } from "effect/testing"
+import { finishHandoff } from "../src/execute.ts"
+import { HandoffRegistry } from "../src/handoff.ts"
 import { adoptionTipForUrl, BrowserControlSessions, shouldAppendAdoptionTip } from "../src/session-manager.ts"
 import { AuthenticatedJsonOutcome } from "../src/relay-schema.ts"
 import type { ConnectedTarget, ExecuteSandboxLike, SessionTarget } from "../src/relay-types.ts"
@@ -1652,6 +1654,49 @@ describe("BrowserControlSessions", () => {
         expect(error.message).toContain("timed out waiting for active execute")
         expect(sandbox.closes()).toBe(0)
         expect(sessions.listSummaries().map((session) => session.id)).toEqual(["alpha"])
+      }),
+    )
+  })
+
+  it.each(["delete", "reset"] as const)("%s cancels a pending handoff instead of waiting for the user's Continue click", async (operation) => {
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const handoffs = new HandoffRegistry()
+        const waiting = yield* Deferred.make<void>()
+        let handoffError = ""
+        const sandbox = makeFakeSandbox({
+          // Mirrors the sandbox's handoff(): block until the human completes or the wait is cancelled.
+          onExecute: Effect.promise(async () => {
+            const wait = handoffs.wait({ sessionId: "alpha", tabId: 7, targetId: "target-7", targetSessionId: "bc-tab-7", message: "Sign in with Google", timeoutMs: 600_000 })
+            Effect.runSync(Deferred.succeed(waiting, undefined))
+            const outcome = await wait.outcome
+            await finishHandoff({ outcome, message: "Sign in with Google", timeoutMs: 600_000, evaluate: async () => {} })
+              .catch((error: unknown) => {
+                handoffError = error instanceof Error ? error.message : String(error)
+              })
+          }),
+        })
+        const sessions = new BrowserControlSessions("http://127.0.0.1:0", () => sandbox, {
+          lifecycleTimeoutMs: 1_000,
+          cancelPendingHandoff: (sessionId, op) => {
+            handoffs.cancelForSession(sessionId, op === "delete" ? "session-deleted" : "session-reset")
+          },
+        })
+        sessions.createNew("alpha")
+
+        const executeFiber = yield* Effect.forkChild(sessions.execute({ sessionId: "alpha", code: "await handoff()", createIfMissing: false }))
+        yield* Deferred.await(waiting)
+
+        if (operation === "delete") {
+          expect(yield* sessions.delete("alpha")).toBe(true)
+          expect(sessions.listSummaries()).toEqual([])
+        } else {
+          expect((yield* sessions.reset("alpha"))?.id).toBe("alpha")
+        }
+        yield* Fiber.join(executeFiber)
+        expect(handoffError).toBe(`Handoff cancelled because its session was ${operation === "delete" ? "deleted" : "reset"}: Sign in with Google`)
+        expect(handoffs.pendingCount).toBe(0)
+        expect(sandbox.closes()).toBe(1)
       }),
     )
   })

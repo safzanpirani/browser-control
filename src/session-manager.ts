@@ -47,6 +47,11 @@ export type SessionHooks = {
   readonly getTargets?: () => readonly ConnectedTarget[]
   /** Persist session identity and target continuity after durable lifecycle changes. */
   readonly onSessionsChanged?: (sessions: readonly PersistedSession[]) => unknown | Promise<unknown>
+  /**
+   * Cancel the session's pending human handoff before a delete or reset waits for its execute
+   * permit; otherwise the lifecycle command times out until someone clicks Continue in the tab.
+   */
+  readonly cancelPendingHandoff?: (sessionId: string, operation: "delete" | "reset") => void
 }
 
 export class SessionError extends Schema.TaggedError<SessionError>()(
@@ -302,6 +307,7 @@ export class BrowserControlSessions {
       if (!session) {
         return false
       }
+      manager.hooks.cancelPendingHandoff?.(id, "delete")
       return yield* manager.withLifecyclePermit(session, "delete", manager.withIdentityChange(id, Effect.gen(function* () {
         if (manager.sessions.get(id) !== session) {
           return false
@@ -325,6 +331,7 @@ export class BrowserControlSessions {
       if (!existing) {
         return undefined
       }
+      manager.hooks.cancelPendingHandoff?.(id, "reset")
       return yield* manager.withLifecyclePermit(existing, "reset", manager.withIdentityChange(id, Effect.gen(function* () {
         if (manager.sessions.get(id) !== existing) {
           return yield* sessionError("inactive", `Session is no longer active: ${id}`, id)
